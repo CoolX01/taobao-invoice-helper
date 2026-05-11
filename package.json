@@ -20,7 +20,7 @@
     "automation"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "playwright": "^1.59.1"
   }
