@@ -1,0 +1,32 @@
+.DS_Store
+node_modules/
+
+# Browser profiles and login state
+.playwright-browser/
+taobao-cookies.json
+cookies.json
+storage-state*.json
+invoice-config.json
+downloads/
+
+# Local invoice/order data and resumable progress
+invoices*.json
+progress*.json
+output*.json
+invoice-action*.json
+invoice-*.json
+!invoice-config.example.json
+*-progress*.json
+*-final*.json
+
+# Debug artifacts
+debug-*.json
+debug-*.html
+debug-*.png
+page-*.png
+page-*.html
+detail-page.png
+error-screenshot.png
+
+# Temporary atomic writes
+*.tmp
