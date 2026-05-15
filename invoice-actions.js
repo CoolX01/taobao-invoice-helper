@@ -589,6 +589,38 @@ function buildSellerMessage(mapping, invoiceConfig) {
     .trim();
 }
 
+function normalizeIdentifier(text) {
+  return String(text || '').replace(/\s+/g, '').replace(/[^0-9A-Za-z]/g, '').toUpperCase();
+}
+
+function looksLikeTaxNo(value, configuredTaxNo = '') {
+  const normalized = normalizeIdentifier(value);
+  const expected = normalizeIdentifier(configuredTaxNo);
+  if (!normalized) return false;
+  if (expected && normalized === expected) return true;
+  return /^[0-9A-Z]{15,20}$/.test(normalized) && /\d{10,}/.test(normalized);
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function bodyShowsTaxNoAsInvoiceTitle(text, invoiceConfig = {}) {
+  const taxNo = normalizeIdentifier(invoiceConfig.taxNo);
+  if (!taxNo) return false;
+  const compact = normalizeIdentifier(text);
+  if (!compact.includes(taxNo)) return false;
+
+  const readable = String(text || '').replace(/\s+/g, '');
+  const taxPattern = String(invoiceConfig.taxNo || '')
+    .split('')
+    .map(escapeRegExp)
+    .join('\\s*');
+  return new RegExp(`(?:发票|抬头|企业)[^\\n\\r]{0,20}${taxPattern}`).test(readable)
+    || readable.includes(`企业-${invoiceConfig.taxNo}`)
+    || readable.includes(`发票${invoiceConfig.taxNo}`);
+}
+
 function looksLikePlatformCustomerService(url) {
   const normalized = String(url || '').toLowerCase();
   return normalized.includes('consumerservice.taobao.com')
@@ -774,6 +806,21 @@ function compareArtifactResults(left, right) {
   return leftReason.length - rightReason.length;
 }
 
+function artifactLooksLikeWrongTitle(node) {
+  const invoiceConfig = loadInvoiceConfig();
+  const texts = [
+    node?.detailBodyText,
+    node?.bodyText,
+    node?.historyText,
+    node?.invoiceInfo?.invoiceTitle,
+    node?.execution?.existingApplication?.reason,
+    node?.execution?.reason,
+  ].filter(value => typeof value === 'string').join('\n');
+  return node?.invoiceInfo?.invoiceType === 'wrong_company_title'
+    || node?.execution?.existingApplication?.titleLooksLikeTaxNo === true
+    || bodyShowsTaxNoAsInvoiceTitle(texts, invoiceConfig);
+}
+
 function collectTerminalResultsFromArtifacts() {
   const results = new Map();
 
@@ -786,7 +833,7 @@ function collectTerminalResultsFromArtifacts() {
 
     const bizOrderId = typeof node.bizOrderId === 'string' ? node.bizOrderId : '';
     const executionStatus = node?.execution?.status;
-    if (bizOrderId && TERMINAL_EXECUTION_STATUS.has(executionStatus)) {
+    if (bizOrderId && TERMINAL_EXECUTION_STATUS.has(executionStatus) && !artifactLooksLikeWrongTitle(node)) {
       const current = results.get(bizOrderId);
       if (!current || compareArtifactResults(node, current) > 0) {
         results.set(bizOrderId, node);
@@ -1019,6 +1066,9 @@ function classifyInvoiceText(bodyText) {
 
   const title = matchField(['发票抬头', '抬头名称', '购买方名称', '购方名称', '购买方', '抬头'], 60);
   if (looksLikeCompanyTitle(title)) {
+    if (looksLikeTaxNo(title)) {
+      return { invoiceType: 'wrong_company_title', invoiceTitle: `错抬头-疑似税号-${title}`, confidence: 'high' };
+    }
     return { invoiceType: 'company', invoiceTitle: `企业-${title}`, confidence: 'high' };
   }
   if (title.includes('个人')) {
@@ -1131,6 +1181,25 @@ async function clickFirstAction(context, page, type) {
       await waitForRelevantPageContent(actionPage);
       await sleep(600);
       return { page: actionPage, openedPopup: Boolean(popup), clickedText: word };
+    }
+  }
+
+  for (const word of group.words) {
+    const locator = page.getByText(word, { exact: true });
+    const count = Math.min(await locator.count().catch(() => 0), 8);
+    for (let i = 0; i < count; i++) {
+      const target = locator.nth(i);
+      if (!(await target.isVisible().catch(() => false))) continue;
+
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+      await target.click({ timeout: 8000 });
+      const popup = await popupPromise;
+      const actionPage = popup || page;
+      await actionPage.waitForLoadState('domcontentloaded', { timeout: CONFIG.pageTimeout }).catch(() => null);
+      await actionPage.waitForLoadState('networkidle', { timeout: CONFIG.detailWaitTimeout }).catch(() => null);
+      await waitForRelevantPageContent(actionPage);
+      await sleep(600);
+      return { page: actionPage, openedPopup: Boolean(popup), clickedText: word, source: 'text_fallback' };
     }
   }
 
@@ -1613,7 +1682,8 @@ function shouldAutoModify(inspection, history) {
   return Boolean(
     inspection?.candidates?.some(candidate => candidate.type === 'modify_invoice' && candidate.visible && !candidate.disabled)
     && (
-      parseResult.hasRetryableError
+      inspection?.invoiceInfo?.invoiceType === 'wrong_company_title'
+      || parseResult.hasRetryableError
       || parseResult.hasExpiredError
       || history?.parseResult?.hasRetryableError
       || history?.parseResult?.hasExpiredError
@@ -1703,14 +1773,18 @@ async function detectExistingInvoiceApplication(page, invoiceConfig) {
   const success = ['已开票', '申请成功', '提交成功', '开票成功', '换开成功'].some(word => bodyText.includes(word));
   const hasCompany = invoiceConfig.companyName && bodyText.includes(invoiceConfig.companyName);
   const hasTaxNo = invoiceConfig.taxNo && bodyText.includes(invoiceConfig.taxNo);
+  const titleLooksLikeTaxNo = bodyShowsTaxNoAsInvoiceTitle(bodyText, invoiceConfig);
 
   if (pending || success) {
     return {
       exists: true,
-      status: success ? 'submitted' : 'pending',
+      status: titleLooksLikeTaxNo ? 'manual_required' : (success ? 'submitted' : 'pending'),
       hasCompany,
       hasTaxNo,
-      reason: success ? '页面显示已提交/成功' : '页面显示申请中/处理中',
+      titleLooksLikeTaxNo,
+      reason: titleLooksLikeTaxNo
+        ? '页面显示已申请，但发票抬头像税号，需走修改申请修正'
+        : (success ? '页面显示已提交/成功' : '页面显示申请中/处理中'),
     };
   }
 
@@ -2977,6 +3051,15 @@ function chooseRecommendedAction(invoiceInfo, candidates) {
   const visibleEnabled = candidates.filter(c => c.visible && !c.disabled);
   const byType = type => visibleEnabled.find(c => c.type === type);
 
+  if (invoiceInfo.invoiceType === 'wrong_company_title' && byType('modify_invoice')) {
+    return { action: 'modify_invoice', confidence: 'high', reason: '发票抬头像税号，发现修改申请入口' };
+  }
+  if (invoiceInfo.invoiceType === 'wrong_company_title' && byType('reissue_invoice')) {
+    return { action: 'reissue_invoice', confidence: 'high', reason: '发票抬头像税号，发现换开入口' };
+  }
+  if (invoiceInfo.invoiceType === 'wrong_company_title') {
+    return { action: 'manual_review', confidence: 'high', reason: '发票抬头像税号，但未发现修改/换开入口，不能按普通下载完成' };
+  }
   if (invoiceInfo.invoiceType === 'personal' && byType('reissue_invoice')) {
     return { action: 'reissue_invoice', confidence: 'medium', reason: '个人发票且发现换开入口' };
   }
@@ -3043,6 +3126,7 @@ async function inspectOrder(page, mapping) {
 
 function shouldSkipExisting(result) {
   if (!result) return false;
+  if (artifactLooksLikeWrongTitle(result)) return false;
   if (cliArgs.execute) {
     return TERMINAL_EXECUTION_STATUS.has(result.execution?.status);
   }
@@ -3126,7 +3210,9 @@ async function main() {
     ? progress.resultsById
     : {};
   const artifactMappings = collectMappingsFromArtifacts();
-  seedTerminalResultsFromArtifacts(resultsById);
+  if (!cliArgs.fresh) {
+    seedTerminalResultsFromArtifacts(resultsById);
+  }
   if (cliArgs.execute) {
     seedContactedLedgerFromArtifacts();
   }

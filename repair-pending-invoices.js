@@ -120,6 +120,34 @@ function normalizeTight(text) {
   return String(text || '').replace(/\s+/g, '');
 }
 
+function normalizeIdentifier(text) {
+  return normalizeTight(text).replace(/[^0-9A-Za-z]/g, '').toUpperCase();
+}
+
+function looksLikeTaxNo(value, invoiceConfig) {
+  const normalized = normalizeIdentifier(value);
+  const configuredTaxNo = normalizeIdentifier(invoiceConfig.taxNo);
+  if (!normalized) return false;
+  if (configuredTaxNo && normalized === configuredTaxNo) return true;
+  return /^[0-9A-Z]{15,20}$/.test(normalized) && /\d{10,}/.test(normalized);
+}
+
+function bodyShowsTaxNoAsInvoiceTitle(text, invoiceConfig) {
+  const taxNo = normalizeIdentifier(invoiceConfig.taxNo);
+  if (!taxNo) return false;
+  const compact = normalizeIdentifier(text);
+  if (!compact.includes(taxNo)) return false;
+
+  const readable = String(text || '').replace(/\s+/g, '');
+  const taxPattern = invoiceConfig.taxNo
+    .split('')
+    .map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\s*');
+  return new RegExp(`(?:发票|抬头|企业)[^\\n\\r]{0,20}${taxPattern}`).test(readable)
+    || readable.includes(`企业-${invoiceConfig.taxNo}`)
+    || readable.includes(`发票${invoiceConfig.taxNo}`);
+}
+
 function buildRequiredShippingNeedles(invoiceConfig) {
   return [
     invoiceConfig.paperShippingAddress || invoiceConfig.address,
@@ -143,10 +171,9 @@ function isWrongIssuedInvoice(result, invoiceConfig) {
 
   const hasModifyEntry = haystack.includes('修改申请');
   const hasWrongTitleInPopup = haystack.includes(`发票抬头： ${taxNo}`) || haystack.includes(`购方税号： ${taxNo}`);
-  const hasWrongTitleOnOrderPage = haystack.includes(`发票 ${taxNo}`);
-  const hasCorrectCompanyName = haystack.includes(invoiceConfig.companyName || '');
+  const hasWrongTitleOnOrderPage = bodyShowsTaxNoAsInvoiceTitle(haystack, invoiceConfig);
 
-  return hasModifyEntry && (hasWrongTitleInPopup || (hasWrongTitleOnOrderPage && hasCorrectCompanyName));
+  return hasModifyEntry && (hasWrongTitleInPopup || hasWrongTitleOnOrderPage);
 }
 
 function pickTrackedOrders() {
@@ -230,6 +257,23 @@ async function clickTextButton(context, page, words) {
       await actionPage.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => null);
       await sleep(1200);
       return { page: actionPage, openedPopup: Boolean(popup), clickedText: word };
+    }
+  }
+
+  for (const word of words) {
+    const locator = page.getByText(word, { exact: true });
+    const count = Math.min(await locator.count().catch(() => 0), 8);
+    for (let i = 0; i < count; i++) {
+      const target = locator.nth(i);
+      if (!(await target.isVisible().catch(() => false))) continue;
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+      await target.click({ timeout: 8000 }).catch(() => null);
+      const popup = await popupPromise;
+      const actionPage = popup || page;
+      await actionPage.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => null);
+      await actionPage.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => null);
+      await sleep(1200);
+      return { page: actionPage, openedPopup: Boolean(popup), clickedText: word, source: 'text_fallback' };
     }
   }
 
@@ -698,7 +742,12 @@ async function inspectHistory(context, page) {
 
 function needsRepair(currentValues, invoiceConfig, history = {}) {
   const isPaperInvoice = currentValues.bodyText?.includes('普通发票-纸质') || currentValues.bodyText?.includes('收货地址');
-  const companyWrong = !currentValues.companyValue.found || currentValues.companyValue.value !== invoiceConfig.companyName;
+  const companyLooksLikeTaxNo = looksLikeTaxNo(currentValues.companyValue?.value, invoiceConfig);
+  const bodyTitleLooksLikeTaxNo = bodyShowsTaxNoAsInvoiceTitle(currentValues.bodyText, invoiceConfig);
+  const companyWrong = !currentValues.companyValue.found
+    || currentValues.companyValue.value !== invoiceConfig.companyName
+    || companyLooksLikeTaxNo
+    || bodyTitleLooksLikeTaxNo;
   const taxWrong = !currentValues.taxValue.found || currentValues.taxValue.value !== invoiceConfig.taxNo;
   const addressLooksWrong = currentValues.addressValue
     && currentValues.addressValue.found
@@ -721,6 +770,8 @@ function needsRepair(currentValues, invoiceConfig, history = {}) {
     repair: companyWrong || taxWrong || addressLooksWrong || shippingWrong || emailWrong,
     isPaperInvoice,
     companyWrong,
+    companyLooksLikeTaxNo,
+    bodyTitleLooksLikeTaxNo,
     taxWrong,
     addressLooksWrong,
     shippingWrong,
@@ -1010,7 +1061,15 @@ async function processOrder(context, page, order, invoiceConfig) {
 
   const editResult = await clickTextButton(context, page, ['修改申请']);
   if (!editResult) {
-    return { ...order, status: 'no_modify_entry', reason: '未找到修改申请入口', history };
+    const bodyText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
+    const wrongTitleDetected = bodyShowsTaxNoAsInvoiceTitle(bodyText, invoiceConfig);
+    return {
+      ...order,
+      status: 'no_modify_entry',
+      reason: wrongTitleDetected ? '检测到税号被当作发票抬头，但未找到修改申请入口' : '未找到修改申请入口',
+      wrongTitleDetected,
+      history,
+    };
   }
 
   const actionPage = editResult.page;
