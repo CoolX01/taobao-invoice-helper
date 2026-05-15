@@ -1,6 +1,6 @@
 {
   "name": "taobao-invoice-helper",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "基于 Playwright 的淘宝/天猫订单发票规划、申请、换开与下载辅助脚本",
   "main": "invoice-actions.js",
   "scripts": {
