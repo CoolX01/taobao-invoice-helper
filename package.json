@@ -11,7 +11,7 @@
     "debug:invoice-form": "node debug-invoice-form.js",
     "archive:detail-check": "node archive/check-invoices-detail-recoverable.js",
     "test:actions": "node invoice-actions.js --fresh --test=5 --output=invoice-action-smoke.json --progress=invoice-action-smoke-progress.json --close-on-finish",
-    "test:syntax": "node --check invoice-actions.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
+    "test:syntax": "node --check invoice-actions.js && node --check repair-paper-invoices.js && node --check repair-pending-invoices.js && node --check status-check-current.js && node --check status-check-invoice-page.js && node --check inspect-invoice-history.js && node --check debug-download-entry.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
   },
   "keywords": [
     "taobao",

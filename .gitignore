@@ -14,8 +14,12 @@ invoices*.json
 progress*.json
 output*.json
 invoice-action*.json
+invoice-action*.csv
 invoice-*.json
 !invoice-config.example.json
+inspect-invoice-history.json
+repair-*.json
+repair-*.csv
 *-progress*.json
 *-final*.json
 

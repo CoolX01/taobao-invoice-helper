@@ -5,5 +5,9 @@
   "phone": "EXAMPLE_PHONE",
   "address": "EXAMPLE_ADDRESS",
   "bankName": "示例银行某支行",
-  "bankAccount": "EXAMPLE_NUMBER"
+  "bankAccount": "EXAMPLE_NUMBER",
+  "paperShippingName": "EXAMPLE_RECIPIENT_NAME",
+  "paperShippingPhone": "EXAMPLE_RECIPIENT_PHONE",
+  "paperShippingAddress": "EXAMPLE_ADDRESS",
+  "sellerMessageTemplate": "您好，这笔订单需要申请开具发票。订单号：{orderId}。烦请协助开具发票。发票信息如下：发票抬头：{companyName}；税号：{taxNo}；发票类型：{invoiceType}；接收邮箱：{email}。如需补充信息，请告知，谢谢。"
 }
