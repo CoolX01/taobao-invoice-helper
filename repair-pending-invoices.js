@@ -52,6 +52,61 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function buildRedactionSecrets(invoiceConfig) {
+  return [
+    invoiceConfig.companyName,
+    invoiceConfig.taxNo,
+    invoiceConfig.email,
+    invoiceConfig.phone,
+    invoiceConfig.address,
+    invoiceConfig.bankName,
+    invoiceConfig.bankAccount,
+    invoiceConfig.paperShippingName,
+    invoiceConfig.paperShippingPhone,
+    invoiceConfig.paperShippingAddress,
+  ].filter(Boolean);
+}
+
+function redactSensitiveText(value, secrets) {
+  let text = String(value || '');
+  for (const secret of secrets) {
+    const raw = String(secret || '');
+    if (!raw) continue;
+    text = text.split(raw).join('[REDACTED]');
+    const tight = normalizeTight(raw);
+    if (tight && tight !== raw) {
+      text = text.split(tight).join('[REDACTED]');
+    }
+  }
+  return text;
+}
+
+function sanitizeForOutput(value, secrets, key = '') {
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeForOutput(item, secrets));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        sanitizeForOutput(childValue, secrets, childKey),
+      ])
+    );
+  }
+  if (typeof value !== 'string') return value;
+  if (key === 'bodyText' || key === 'historyText') {
+    return value ? '[REDACTED_FULL_TEXT]' : '';
+  }
+  if (['value', 'beforeValue', 'afterValue', 'text'].includes(key) && value) {
+    return '[REDACTED]';
+  }
+  return redactSensitiveText(value, secrets);
+}
+
+function saveSanitizedJson(file, data, invoiceConfig) {
+  saveJson(file, sanitizeForOutput(data, buildRedactionSecrets(invoiceConfig)));
+}
+
 function buildInvoiceUrl(orderId, fallbackUrl = '') {
   return fallbackUrl || `https://invoice-ua.taobao.com/detail/pc#/?orderId=${orderId}`;
 }
@@ -1094,11 +1149,11 @@ async function main() {
   }
 
   const summary = buildSummary(results);
-  saveJson(OUTPUT_FILE, {
+  saveSanitizedJson(OUTPUT_FILE, {
     generatedAt: new Date().toISOString(),
     summary,
     results,
-  });
+  }, invoiceConfig);
 
   console.log(JSON.stringify(summary, null, 2));
   await browser.close();

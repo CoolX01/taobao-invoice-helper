@@ -170,7 +170,7 @@ async function extractInvoiceFromDetail(page, mapping) {
       }
 
       const invoiceText = invoiceAreas.join(' ');
-      if (invoiceText.includes('企业') || invoiceText.includes('公司') || invoiceText.includes('公司')) {
+      if (invoiceText.includes('企业') || invoiceText.includes('公司') || invoiceText.includes('增值税')) {
         return { invoiceType: 'company', invoiceTitle: '企业发票（从上下文推断）', confidence: 'medium' };
       }
       if (invoiceText.includes('个人')) {

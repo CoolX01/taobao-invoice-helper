@@ -84,6 +84,61 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function buildRedactionSecrets(invoiceConfig) {
+  return [
+    invoiceConfig.companyName,
+    invoiceConfig.taxNo,
+    invoiceConfig.email,
+    invoiceConfig.phone,
+    invoiceConfig.address,
+    invoiceConfig.bankName,
+    invoiceConfig.bankAccount,
+    invoiceConfig.paperShippingName,
+    invoiceConfig.paperShippingPhone,
+    invoiceConfig.paperShippingAddress,
+  ].filter(Boolean);
+}
+
+function redactSensitiveText(value, secrets) {
+  let text = String(value || '');
+  for (const secret of secrets) {
+    const raw = String(secret || '');
+    if (!raw) continue;
+    text = text.split(raw).join('[REDACTED]');
+    const tight = normalizeTight(raw);
+    if (tight && tight !== raw) {
+      text = text.split(tight).join('[REDACTED]');
+    }
+  }
+  return text;
+}
+
+function sanitizeForOutput(value, secrets, key = '') {
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeForOutput(item, secrets));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([childKey, childValue]) => [
+        childKey,
+        sanitizeForOutput(childValue, secrets, childKey),
+      ])
+    );
+  }
+  if (typeof value !== 'string') return value;
+  if (key === 'bodyText' || key === 'historyText') {
+    return value ? '[REDACTED_FULL_TEXT]' : '';
+  }
+  if (['value', 'beforeValue', 'afterValue', 'text'].includes(key) && value) {
+    return '[REDACTED]';
+  }
+  return redactSensitiveText(value, secrets);
+}
+
+function saveSanitizedJson(file, data, invoiceConfig) {
+  saveJson(file, sanitizeForOutput(data, buildRedactionSecrets(invoiceConfig)));
+}
+
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -1831,25 +1886,25 @@ async function main() {
       const partialResults = orders
         .map(item => resultsById[item.bizOrderId])
         .filter(Boolean);
-      saveJson(PROGRESS_FILE, {
+      saveSanitizedJson(PROGRESS_FILE, {
         generatedAt: new Date().toISOString(),
         outputFile: OUTPUT_FILE,
         totalOrders: orders.length,
         completed: partialResults.length,
         resultsById,
         summary: buildSummary(partialResults),
-      });
+      }, invoiceConfig);
     }
   } finally {
     const finalResults = orders
       .map(item => resultsById[item.bizOrderId])
       .filter(Boolean);
-    saveJson(OUTPUT_FILE, {
+    saveSanitizedJson(OUTPUT_FILE, {
       generatedAt: new Date().toISOString(),
       requiredShippingNeedles: REQUIRED_SHIPPING_NEEDLES,
       summary: buildSummary(finalResults),
       results: finalResults,
-    });
+    }, invoiceConfig);
     await browser.close().catch(() => null);
   }
 }

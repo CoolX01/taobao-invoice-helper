@@ -15,10 +15,15 @@ progress*.json
 output*.json
 invoice-action*.json
 invoice-action*.csv
+invoice-status*.json
 invoice-audit-report*.json
 invoice-audit-report*.csv
 invoice-rejection-report*.json
 invoice-rejection-report*.csv
+repair-*.json
+repair-*.csv
+inspect-invoice-history*.json
+status-check*.json
 contacted-orders.json
 contacted-orders*.json
 contacted-orders*.csv
