@@ -81,6 +81,12 @@ npm run debug:order-list
 npm run debug:invoice-form -- --plan-file=invoice-action-progress.json --order-id=ORDER_ID_EXAMPLE
 ```
 
+生成只读盘点报告和拒绝原因分类：
+
+```bash
+npm run report:audit -- --write-contacted-ledger
+```
+
 ## 执行模式说明
 
 `invoice-actions.js` 支持这些动作：
@@ -109,6 +115,8 @@ npm run debug:invoice-form -- --plan-file=invoice-action-progress.json --order-i
 - `--results-csv=xxx.csv`：指定 CSV 结果表路径
 - `--max-retries=2`：可修正失败时最多重试次数
 - `--manual-timeout-ms=900000`：人工验证等待超时
+- `--contacted-ledger=contacted-orders.json`：联系商家防重复台账
+- `--force-contact`：忽略台账，强制重新联系商家
 
 ## 项目特点
 
@@ -116,6 +124,8 @@ npm run debug:invoice-form -- --plan-file=invoice-action-progress.json --order-i
 - 同一轮处理结束后自动关闭额外标签页，避免越跑越多
 - 支持下载、提交、处理中、跳过等状态落盘
 - 支持 `seller_contacted`、`manual_required`、`expired_deadline` 等更细的执行状态
+- 支持只读生成总盘点报告和商家拒绝原因分类报告
+- 支持独立联系商家台账，避免重复发送旺旺消息
 - 支持中断后从进度文件恢复
 - 对旧版开票页面做了兼容
 - 对“超过开票日期”类提示增加了同月提前截断逻辑，减少无效尝试

@@ -1,7 +1,7 @@
 {
   "name": "taobao-invoice-helper",
-  "version": "1.1.0",
-  "description": "基于 Playwright 的淘宝/天猫订单发票规划、申请、换开与下载辅助脚本",
+  "version": "1.0.0",
+  "description": "淘宝订单发票规划、申请、下载与换开辅助脚本",
   "main": "invoice-actions.js",
   "scripts": {
     "start": "node invoice-actions.js",
@@ -9,9 +9,11 @@
     "execute:all": "node invoice-actions.js --execute --action=all --confirm=YES_EXECUTE_TAOBAO_INVOICE_ACTIONS",
     "debug:order-list": "node debug-order-list.js --pages=3",
     "debug:invoice-form": "node debug-invoice-form.js",
+    "report:audit": "node invoice-audit-report.js",
     "archive:detail-check": "node archive/check-invoices-detail-recoverable.js",
     "test:actions": "node invoice-actions.js --fresh --test=5 --output=invoice-action-smoke.json --progress=invoice-action-smoke-progress.json --close-on-finish",
-    "test:syntax": "node --check invoice-actions.js && node --check repair-paper-invoices.js && node --check repair-pending-invoices.js && node --check status-check-current.js && node --check status-check-invoice-page.js && node --check inspect-invoice-history.js && node --check debug-download-entry.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
+    "test:classifier": "node test-rejection-classifier.js",
+    "test:syntax": "node --check invoice-actions.js && node --check invoice-audit-report.js && node --check test-rejection-classifier.js && node --check repair-paper-invoices.js && node --check repair-pending-invoices.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
   },
   "keywords": [
     "taobao",
@@ -20,7 +22,7 @@
     "automation"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "ISC",
   "dependencies": {
     "playwright": "^1.59.1"
   }

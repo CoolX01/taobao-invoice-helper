@@ -43,6 +43,8 @@ function parseArgs() {
     resultsCsv: '',
     maxRetries: 2,
     manualTimeoutMs: 15 * 60 * 1000,
+    contactedLedger: 'contacted-orders.json',
+    forceContact: false,
   };
 
   for (let i = 2; i < process.argv.length; i++) {
@@ -63,6 +65,10 @@ function parseArgs() {
       args.fresh = true;
       continue;
     }
+    if (arg === '--force-contact') {
+      args.forceContact = true;
+      continue;
+    }
     if (!arg.startsWith('--')) continue;
     const [key, value = ''] = arg.slice(2).split('=');
     if (key === 'test') args.test = parseInt(value, 10) || null;
@@ -79,6 +85,7 @@ function parseArgs() {
     if (key === 'results-csv') args.resultsCsv = value;
     if (key === 'max-retries') args.maxRetries = Math.max(1, parseInt(value, 10) || args.maxRetries);
     if (key === 'manual-timeout-ms') args.manualTimeoutMs = Math.max(30000, parseInt(value, 10) || args.manualTimeoutMs);
+    if (key === 'contacted-ledger') args.contactedLedger = value || args.contactedLedger;
   }
 
   return args;
@@ -103,6 +110,7 @@ const OUTPUT_CSV_FILE = safeRelativePath(
 const PROGRESS_FILE = safeRelativePath(cliArgs.progress, 'invoice-action-progress.json');
 const CONFIG_FILE = safeRelativePath(cliArgs.config, 'invoice-config.json');
 const DOWNLOAD_DIR = safeRelativePath(cliArgs.downloadDir, 'downloads');
+const CONTACTED_LEDGER_FILE = safeRelativePath(cliArgs.contactedLedger, 'contacted-orders.json');
 const DEBUG_CHAT_FILE = path.join(__dirname, 'debug-chat-page.json');
 const LIST_URL = 'https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm';
 const CONFIRM_TEXT = 'YES_EXECUTE_TAOBAO_INVOICE_ACTIONS';
@@ -259,6 +267,66 @@ function saveJsonAtomic(file, data) {
 
 function saveDebugJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function loadContactedLedger() {
+  if (!fs.existsSync(CONTACTED_LEDGER_FILE)) {
+    return { version: '0.1.0', orders: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CONTACTED_LEDGER_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return {
+        version: parsed.version || '0.1.0',
+        generatedFromArtifactsAt: parsed.generatedFromArtifactsAt || '',
+        updatedAt: parsed.updatedAt || '',
+        orders: parsed.orders && typeof parsed.orders === 'object' ? parsed.orders : {},
+      };
+    }
+  } catch (error) {
+    console.error(`⚠️  联系商家台账读取失败，将新建台账: ${error.message}`);
+  }
+  return { version: '0.1.0', orders: {} };
+}
+
+function saveContactedLedger(ledger) {
+  saveJsonAtomic(CONTACTED_LEDGER_FILE, {
+    version: ledger.version || '0.1.0',
+    generatedFromArtifactsAt: ledger.generatedFromArtifactsAt || '',
+    updatedAt: new Date().toISOString(),
+    orders: ledger.orders || {},
+  });
+}
+
+function getContactedLedgerRecord(orderId) {
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) return null;
+  const ledger = loadContactedLedger();
+  return ledger.orders?.[normalizedOrderId] || null;
+}
+
+function recordContactedOrder(mapping, message, patch = {}) {
+  const orderId = String(mapping?.bizOrderId || '').trim();
+  if (!orderId) return null;
+  const ledger = loadContactedLedger();
+  const existing = ledger.orders?.[orderId] || {};
+  const record = {
+    orderId,
+    shopName: mapping.shopName || existing.shopName || '',
+    amount: mapping.amount || existing.amount || '',
+    orderDate: mapping.orderDate || existing.orderDate || '',
+    invoiceUrl: mapping.invoiceUrl || mapping.detailUrl || mapping.url || existing.invoiceUrl || '',
+    rejectType: mapping.rejectInfo?.rejectType || existing.rejectType || '',
+    rejectReason: mapping.rejectInfo?.rejectReason || mapping.contactReason || existing.rejectReason || '',
+    message: message || existing.message || '',
+    contactedAt: patch.contactedAt || existing.contactedAt || new Date().toISOString(),
+    finalUrl: patch.finalUrl || existing.finalUrl || '',
+    source: patch.source || existing.source || '',
+    updatedAt: new Date().toISOString(),
+  };
+  ledger.orders = { ...(ledger.orders || {}), [orderId]: record };
+  saveContactedLedger(ledger);
+  return record;
 }
 
 function csvEscape(value) {
@@ -741,6 +809,41 @@ function collectTerminalResultsFromArtifacts() {
   }
 
   return results;
+}
+
+function seedContactedLedgerFromArtifacts() {
+  const ledger = loadContactedLedger();
+  let changed = false;
+
+  for (const [orderId, artifact] of collectTerminalResultsFromArtifacts()) {
+    if (artifact?.execution?.status !== 'seller_contacted') continue;
+    if (ledger.orders?.[orderId]) continue;
+
+    const contactResult = artifact.execution.contactResult || {};
+    const message = contactResult.message || artifact.execution.message || '';
+    ledger.orders = ledger.orders || {};
+    ledger.orders[orderId] = {
+      orderId,
+      shopName: artifact.shopName || artifact.orderMeta?.shopName || '',
+      amount: artifact.amount || artifact.orderMeta?.amount || '',
+      orderDate: artifact.orderDate || '',
+      invoiceUrl: artifact.invoiceUrl || artifact.detailUrl || artifact.url || '',
+      rejectType: artifact.rejectedDecision?.rejectInfo?.latest?.rejectType || '',
+      rejectReason: artifact.rejectedDecision?.rejectInfo?.latest?.rejectReason || '',
+      message,
+      contactedAt: contactResult.executedAt || artifact.execution.executedAt || artifact.checkedAt || new Date().toISOString(),
+      finalUrl: contactResult.finalUrl || artifact.execution.finalUrl || '',
+      source: 'artifact_seed',
+      updatedAt: new Date().toISOString(),
+    };
+    changed = true;
+  }
+
+  if (changed) {
+    ledger.generatedFromArtifactsAt = ledger.generatedFromArtifactsAt || new Date().toISOString();
+    saveContactedLedger(ledger);
+    console.log(`🧾 已从历史结果补全联系商家台账: ${CONTACTED_LEDGER_FILE}`);
+  }
 }
 
 async function ensureLoggedIn(page) {
@@ -2144,13 +2247,20 @@ async function sendSellerMessageOnPage(page, mapping, invoiceConfig) {
     };
   }
 
-  return {
+  const executedAt = new Date().toISOString();
+  const result = {
     status: 'seller_contacted',
     reason: '已联系商家申请开票',
     message,
-    executedAt: new Date().toISOString(),
+    executedAt,
     finalUrl: page.url(),
   };
+  recordContactedOrder(mapping, message, {
+    contactedAt: executedAt,
+    finalUrl: result.finalUrl,
+    source: 'sendSellerMessageOnPage',
+  });
+  return result;
 }
 
 async function openOrderInListPage(page, orderId) {
@@ -2387,6 +2497,20 @@ async function tryContactSellerOnPage(context, page, mapping, invoiceConfig, sou
 
 async function contactSellerForInvoice(context, page, mapping, invoiceConfig) {
   console.log(`    [联系商家] 开始处理订单 ${mapping.bizOrderId}`);
+  const contactedRecord = getContactedLedgerRecord(mapping.bizOrderId);
+  if (contactedRecord && !cliArgs.forceContact) {
+    console.log(`    [联系商家] 台账已有记录，跳过重复发送: ${mapping.bizOrderId}`);
+    return {
+      status: 'seller_contacted',
+      reason: '已在联系商家台账中，跳过重复发送',
+      skippedDuplicate: true,
+      ledgerRecord: contactedRecord,
+      message: contactedRecord.message || '',
+      executedAt: contactedRecord.contactedAt || contactedRecord.updatedAt || new Date().toISOString(),
+      finalUrl: contactedRecord.finalUrl || page.url(),
+    };
+  }
+
   const inlineAttempt = await tryContactSellerOnPage(context, page, mapping, invoiceConfig, '发票页');
   if (inlineAttempt.status === 'seller_contacted') {
     return inlineAttempt;
@@ -2802,7 +2926,11 @@ async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
     };
   }
   if (rejectedDecision.action === 'contact_seller') {
-    const contactResult = await contactSellerForInvoice(context, page, mapping, invoiceConfig);
+    const contactResult = await contactSellerForInvoice(context, page, {
+      ...mapping,
+      rejectInfo: rejectedDecision.rejectInfo?.latest || null,
+      contactReason: rejectedDecision.reason,
+    }, invoiceConfig);
     return {
       ...inspection,
       history,
@@ -2999,6 +3127,9 @@ async function main() {
     : {};
   const artifactMappings = collectMappingsFromArtifacts();
   seedTerminalResultsFromArtifacts(resultsById);
+  if (cliArgs.execute) {
+    seedContactedLedgerFromArtifacts();
+  }
   const overdueCutoffByMonth = new Map();
   for (const existing of Object.values(resultsById)) {
     if (existing?.execution?.status !== 'expired_deadline') continue;

@@ -15,11 +15,13 @@ progress*.json
 output*.json
 invoice-action*.json
 invoice-action*.csv
-invoice-*.json
-!invoice-config.example.json
-inspect-invoice-history.json
-repair-*.json
-repair-*.csv
+invoice-audit-report*.json
+invoice-audit-report*.csv
+invoice-rejection-report*.json
+invoice-rejection-report*.csv
+contacted-orders.json
+contacted-orders*.json
+contacted-orders*.csv
 *-progress*.json
 *-final*.json
 
