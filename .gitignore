@@ -15,7 +15,10 @@ progress*.json
 output*.json
 invoice-action*.json
 invoice-action*.csv
+invoice-smoke*.json
+invoice-smoke*.csv
 invoice-status*.json
+invoice-status*.csv
 invoice-audit-report*.json
 invoice-audit-report*.csv
 invoice-rejection-report*.json
@@ -27,10 +30,19 @@ status-check*.json
 contacted-orders.json
 contacted-orders*.json
 contacted-orders*.csv
+downloaded-invoices.json
+downloaded-invoices*.json
+modified-orders.json
+modified-orders*.json
+seller-chat-replies.json
+seller-chat-replies*.json
+seller-chat-followup*.json
+seller-chat-followup*.csv
 *-progress*.json
 *-final*.json
 
 # Debug artifacts
+snapshots/
 debug-*.json
 debug-*.html
 debug-*.png

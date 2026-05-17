@@ -183,8 +183,8 @@ function classifyRejectedInvoiceHandling({ detailText = '', historyText = '', ha
   if (clearlyFixableInForm) {
     if (!hasModifyEntry) {
       return {
-        action: 'manual_required',
-        reason: `拒绝原因看起来可修正，但页面没有可用修改申请入口：${rejectReason || rejectType}`,
+        action: 'contact_seller',
+        reason: `拒绝原因看起来可修正，但页面没有可用修改申请入口，改为联系商家：${rejectReason || rejectType}`,
         rejectInfo,
         parseResult,
       };

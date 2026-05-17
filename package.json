@@ -7,13 +7,14 @@
     "start": "node invoice-actions.js",
     "plan": "node invoice-actions.js",
     "execute:all": "node invoice-actions.js --execute --action=all --confirm=YES_EXECUTE_TAOBAO_INVOICE_ACTIONS",
+    "execute:chat": "node invoice-actions.js --execute --action=chat --confirm=YES_EXECUTE_TAOBAO_INVOICE_ACTIONS",
     "debug:order-list": "node debug-order-list.js --pages=3",
     "debug:invoice-form": "node debug-invoice-form.js",
     "report:audit": "node invoice-audit-report.js",
     "archive:detail-check": "node archive/check-invoices-detail-recoverable.js",
     "test:actions": "node invoice-actions.js --fresh --test=5 --output=invoice-action-smoke.json --progress=invoice-action-smoke-progress.json --close-on-finish",
-    "test:classifier": "node test-rejection-classifier.js",
-    "test:syntax": "node --check invoice-actions.js && node --check invoice-audit-report.js && node --check test-rejection-classifier.js && node --check repair-paper-invoices.js && node --check repair-pending-invoices.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
+    "test:classifier": "node test-rejection-classifier.js && node test-error-classifier.js && node test-chat-reply-classifier.js",
+    "test:syntax": "node --check invoice-actions.js && node --check error-classifier.js && node --check order-state-machine.js && node --check invoice-audit-report.js && node --check test-rejection-classifier.js && node --check test-error-classifier.js && node --check test-chat-reply-classifier.js && node --check repair-paper-invoices.js && node --check repair-pending-invoices.js && node --check debug-order-list.js && node --check debug-invoice-form.js && node --check archive/check-invoices-detail-recoverable.js"
   },
   "keywords": [
     "taobao",

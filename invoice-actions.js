@@ -6,6 +6,18 @@ process.stderr.setEncoding('utf8');
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const {
+  classifyInvoicePage,
+  classifyPageErrorText: classifyRichPageErrorText,
+} = require('./error-classifier');
+const {
+  ORDER_STATES,
+  appendStateEvent,
+  createOrderTrace,
+  deriveStateFromClassification,
+  deriveStateFromExecution,
+  isTerminalState,
+} = require('./order-state-machine');
 
 function formatDate(date) {
   const year = date.getFullYear();
@@ -44,7 +56,15 @@ function parseArgs() {
     maxRetries: 2,
     manualTimeoutMs: 15 * 60 * 1000,
     contactedLedger: 'contacted-orders.json',
+    downloadedLedger: 'downloaded-invoices.json',
+    modifiedLedger: 'modified-orders.json',
+    chatReplyLedger: 'seller-chat-replies.json',
+    snapshotDir: 'snapshots',
     forceContact: false,
+    forceDownload: false,
+    outputExplicit: false,
+    progressExplicit: false,
+    resultsCsvExplicit: false,
   };
 
   for (let i = 2; i < process.argv.length; i++) {
@@ -69,23 +89,47 @@ function parseArgs() {
       args.forceContact = true;
       continue;
     }
+    if (arg === '--force-download') {
+      args.forceDownload = true;
+      continue;
+    }
     if (!arg.startsWith('--')) continue;
     const [key, value = ''] = arg.slice(2).split('=');
     if (key === 'test') args.test = parseInt(value, 10) || null;
     if (key === 'order-id' && value) args.orderIds.push(...value.split(',').map(item => item.trim()).filter(Boolean));
     if (key === 'max-pages') args.maxPages = parseInt(value, 10) || args.maxPages;
-    if (key === 'output') args.output = value;
-    if (key === 'progress') args.progress = value;
+    if (key === 'output') {
+      args.output = value;
+      args.outputExplicit = true;
+    }
+    if (key === 'progress') {
+      args.progress = value;
+      args.progressExplicit = true;
+    }
     if (key === 'confirm') args.confirm = value;
     if (key === 'action') args.action = value || args.action;
     if (key === 'start-date') args.startDate = value || args.startDate;
     if (key === 'end-date') args.endDate = value || args.endDate;
     if (key === 'download-dir') args.downloadDir = value || args.downloadDir;
     if (key === 'config') args.config = value || args.config;
-    if (key === 'results-csv') args.resultsCsv = value;
+    if (key === 'results-csv') {
+      args.resultsCsv = value;
+      args.resultsCsvExplicit = true;
+    }
     if (key === 'max-retries') args.maxRetries = Math.max(1, parseInt(value, 10) || args.maxRetries);
     if (key === 'manual-timeout-ms') args.manualTimeoutMs = Math.max(30000, parseInt(value, 10) || args.manualTimeoutMs);
     if (key === 'contacted-ledger') args.contactedLedger = value || args.contactedLedger;
+    if (key === 'downloaded-ledger') args.downloadedLedger = value || args.downloadedLedger;
+    if (key === 'modified-ledger') args.modifiedLedger = value || args.modifiedLedger;
+    if (key === 'chat-reply-ledger') args.chatReplyLedger = value || args.chatReplyLedger;
+    if (key === 'snapshot-dir') args.snapshotDir = value || args.snapshotDir;
+  }
+
+  if (args.action === 'chat' || args.action === 'chat-followup') {
+    args.action = 'chat';
+    if (!args.outputExplicit) args.output = 'seller-chat-followup.json';
+    if (!args.progressExplicit) args.progress = 'seller-chat-followup-progress.json';
+    if (!args.resultsCsvExplicit) args.resultsCsv = 'seller-chat-followup.csv';
   }
 
   return args;
@@ -111,6 +155,10 @@ const PROGRESS_FILE = safeRelativePath(cliArgs.progress, 'invoice-action-progres
 const CONFIG_FILE = safeRelativePath(cliArgs.config, 'invoice-config.json');
 const DOWNLOAD_DIR = safeRelativePath(cliArgs.downloadDir, 'downloads');
 const CONTACTED_LEDGER_FILE = safeRelativePath(cliArgs.contactedLedger, 'contacted-orders.json');
+const DOWNLOADED_LEDGER_FILE = safeRelativePath(cliArgs.downloadedLedger, 'downloaded-invoices.json');
+const MODIFIED_LEDGER_FILE = safeRelativePath(cliArgs.modifiedLedger, 'modified-orders.json');
+const CHAT_REPLY_LEDGER_FILE = safeRelativePath(cliArgs.chatReplyLedger, 'seller-chat-replies.json');
+const SNAPSHOT_DIR = safeRelativePath(cliArgs.snapshotDir, 'snapshots');
 const DEBUG_CHAT_FILE = path.join(__dirname, 'debug-chat-page.json');
 const LIST_URL = 'https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm';
 const CONFIRM_TEXT = 'YES_EXECUTE_TAOBAO_INVOICE_ACTIONS';
@@ -150,8 +198,8 @@ const ACTION_KEYWORDS = [
 const MUTATING_ACTIONS = new Set(['apply_invoice', 'reissue_invoice', 'modify_invoice', 'send_email']);
 const RETRYABLE_STATUS = new Set(['error']);
 const UNCERTAIN_STATUS = new Set(['unknown', 'no_action']);
-const EXECUTABLE_ACTIONS = new Set(['reissue', 'apply', 'download', 'all']);
-const TERMINAL_EXECUTION_STATUS = new Set(['submitted', 'pending', 'downloaded', 'skipped', 'seller_contacted']);
+const EXECUTABLE_ACTIONS = new Set(['reissue', 'apply', 'download', 'all', 'chat']);
+const TERMINAL_EXECUTION_STATUS = new Set(['submitted', 'pending', 'downloaded', 'file_exists', 'skipped', 'seller_contacted']);
 
 const VERIFICATION_TEXT_MARKERS = [
   '请扫码登录',
@@ -183,6 +231,12 @@ const MESSAGE_FIELD_SELECTORS = [
 const SEND_BUTTON_TEXTS = ['发送', '发 送', '确认发送', '发送消息'];
 const WEB_CHAT_TEXTS = ['网页聊天', '网页版聊天', '继续网页聊天', '继续网页版聊天', '继续使用网页聊天', '留在网页版'];
 const CHAT_HINT_CLOSE_SELECTORS = ['.next-balloon-close', '[aria-label="关闭"]', '[title="关闭"]'];
+const CHAT_INVOICE_FILE_EXTENSIONS = ['.pdf', '.ofd', '.xml', '.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.webp'];
+const CHAT_INVOICE_LINK_PATTERN = /发票|电子票|电子发票|开票|附件|文件|下载|pdf|ofd|invoice|fapiao|bill/i;
+const CHAT_PAYMENT_PATTERN = /补差|差价|差额|付款|支付|收款码|补款|补邮费|补运费/;
+const CHAT_INFO_REQUEST_PATTERN = /请.*(提供|补充|发送).*(邮箱|抬头|税号|纳税人|资料|信息)|需要.*(邮箱|抬头|税号|纳税人|资料|信息)|(邮箱|抬头|税号|纳税人识别号).*(发一下|提供一下|发我|给我)/;
+const CHAT_REJECTION_PATTERN = /无法开|不能开|开不了|不给开|不支持开|已超过|过期|超时|无法补开|无法重开/;
+const CHAT_FILE_DOWNLOAD_TEXTS = ['下载文件', '下载附件', '保存文件', '下载'];
 
 const PAGE_ERROR_HINTS = {
   expired: [
@@ -212,6 +266,20 @@ const DEFAULT_SELLER_MESSAGE_TEMPLATE = [
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, timeoutMs, fallbackValue) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve(fallbackValue), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function randomDelay() {
@@ -256,6 +324,7 @@ function loadInvoiceConfig() {
     address: (config.address || '').trim(),
     bankName: (config.bankName || '').trim(),
     bankAccount: (config.bankAccount || '').trim(),
+    sellerMessageTemplate: (config.sellerMessageTemplate || '').trim(),
   };
 }
 
@@ -267,6 +336,81 @@ function saveJsonAtomic(file, data) {
 
 function saveDebugJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function buildRedactionSecrets(invoiceConfig = {}) {
+  return Object.values(invoiceConfig || {})
+    .filter(value => typeof value === 'string')
+    .map(value => value.trim())
+    .filter(value => value.length >= 4 && !/^EXAMPLE_/i.test(value));
+}
+
+function redactSensitiveText(text, invoiceConfig = {}) {
+  let next = String(text || '');
+  for (const secret of buildRedactionSecrets(invoiceConfig)) {
+    next = next.split(secret).join(`[REDACTED_${secret.length}]`);
+  }
+  return next;
+}
+
+async function collectPageSnapshot(page, mapping, label, invoiceConfig = {}, options = {}) {
+  const { saveArtifacts = false, historyText = '', invoiceInfo = null, candidates = null } = options;
+  const capturedAt = new Date().toISOString();
+  const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+  const title = await page.title().catch(() => '');
+  const url = page.url();
+  const buttonTexts = await page.evaluate(() => {
+    function isVisible(el) {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    }
+    return [...document.querySelectorAll('button, a, [role="button"]')]
+      .filter(isVisible)
+      .map(el => (el.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, 120);
+  }).catch(() => []);
+  const actionCandidates = candidates || await collectActionCandidates(page).catch(() => []);
+
+  const snapshot = {
+    capturedAt,
+    label,
+    orderId: mapping?.bizOrderId || '',
+    url,
+    title,
+    text: bodyText,
+    historyText,
+    buttons: buttonTexts,
+    candidates: actionCandidates,
+    invoiceInfo,
+    artifacts: {},
+  };
+
+  if (!saveArtifacts) return snapshot;
+
+  ensureDirectory(SNAPSHOT_DIR);
+  const stamp = capturedAt.replace(/[-:.TZ]/g, '').slice(0, 14);
+  const baseName = [
+    stamp,
+    sanitizeFilenamePart(mapping?.bizOrderId || 'unknown_order'),
+    sanitizeFilenamePart(label || 'snapshot'),
+  ].filter(Boolean).join('_');
+  const screenshotPath = path.join(SNAPSHOT_DIR, `${baseName}.png`);
+  const htmlPath = path.join(SNAPSHOT_DIR, `${baseName}.html`);
+  const textPath = path.join(SNAPSHOT_DIR, `${baseName}.txt`);
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => null);
+  const html = await page.content().catch(() => '');
+  fs.writeFileSync(htmlPath, redactSensitiveText(html, invoiceConfig), 'utf8');
+  fs.writeFileSync(textPath, redactSensitiveText(bodyText, invoiceConfig), 'utf8');
+
+  snapshot.artifacts = {
+    screenshotPath: fs.existsSync(screenshotPath) ? screenshotPath : '',
+    htmlSnapshotPath: htmlPath,
+    textSnapshotPath: textPath,
+  };
+  return snapshot;
 }
 
 function loadContactedLedger() {
@@ -296,6 +440,180 @@ function saveContactedLedger(ledger) {
     updatedAt: new Date().toISOString(),
     orders: ledger.orders || {},
   });
+}
+
+function loadDownloadedLedger() {
+  if (!fs.existsSync(DOWNLOADED_LEDGER_FILE)) {
+    return { version: '0.1.0', orders: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DOWNLOADED_LEDGER_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return {
+        version: parsed.version || '0.1.0',
+        updatedAt: parsed.updatedAt || '',
+        orders: parsed.orders && typeof parsed.orders === 'object' ? parsed.orders : {},
+      };
+    }
+  } catch (error) {
+    console.error(`⚠️  下载台账读取失败，将新建台账: ${error.message}`);
+  }
+  return { version: '0.1.0', orders: {} };
+}
+
+function saveDownloadedLedger(ledger) {
+  saveJsonAtomic(DOWNLOADED_LEDGER_FILE, {
+    version: ledger.version || '0.1.0',
+    updatedAt: new Date().toISOString(),
+    orders: ledger.orders || {},
+  });
+}
+
+function getDownloadedLedgerRecord(orderId) {
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) return null;
+  const ledger = loadDownloadedLedger();
+  const record = ledger.orders?.[normalizedOrderId] || null;
+  if (!record?.path) return record;
+  return fs.existsSync(record.path) ? record : null;
+}
+
+function recordDownloadedInvoice(mapping, downloadResult, inspection) {
+  const orderId = String(mapping?.bizOrderId || '').trim();
+  if (!orderId || !downloadResult?.path) return null;
+  const ledger = loadDownloadedLedger();
+  const existing = ledger.orders?.[orderId] || {};
+  const record = {
+    orderId,
+    shopName: mapping.shopName || inspection?.orderMeta?.shopName || existing.shopName || '',
+    amount: mapping.amount || inspection?.orderMeta?.amount || existing.amount || '',
+    orderDate: mapping.orderDate || existing.orderDate || '',
+    invoiceType: inspection?.invoiceInfo?.invoiceType || existing.invoiceType || '',
+    invoiceTitle: inspection?.invoiceInfo?.invoiceTitle || existing.invoiceTitle || '',
+    filename: downloadResult.filename || existing.filename || '',
+    path: downloadResult.path || existing.path || '',
+    downloadedAt: downloadResult.downloadedAt || existing.downloadedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  ledger.orders = { ...(ledger.orders || {}), [orderId]: record };
+  saveDownloadedLedger(ledger);
+  return record;
+}
+
+function loadChatReplyLedger() {
+  if (!fs.existsSync(CHAT_REPLY_LEDGER_FILE)) {
+    return { version: '0.1.0', orders: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CHAT_REPLY_LEDGER_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return {
+        version: parsed.version || '0.1.0',
+        updatedAt: parsed.updatedAt || '',
+        orders: parsed.orders && typeof parsed.orders === 'object' ? parsed.orders : {},
+      };
+    }
+  } catch (error) {
+    console.error(`⚠️  商家聊天回访台账读取失败，将新建台账: ${error.message}`);
+  }
+  return { version: '0.1.0', orders: {} };
+}
+
+function saveChatReplyLedger(ledger) {
+  saveJsonAtomic(CHAT_REPLY_LEDGER_FILE, {
+    version: ledger.version || '0.1.0',
+    updatedAt: new Date().toISOString(),
+    orders: ledger.orders || {},
+  });
+}
+
+function getChatReplyLedgerRecord(orderId) {
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) return null;
+  const ledger = loadChatReplyLedger();
+  return ledger.orders?.[normalizedOrderId] || null;
+}
+
+function recordChatReplyOrder(mapping, result, patch = {}) {
+  const orderId = String(mapping?.bizOrderId || mapping?.orderId || '').trim();
+  if (!orderId) return null;
+  const ledger = loadChatReplyLedger();
+  const existing = ledger.orders?.[orderId] || {};
+  const record = {
+    orderId,
+    shopName: mapping.shopName || existing.shopName || '',
+    amount: mapping.amount || existing.amount || '',
+    orderDate: mapping.orderDate || existing.orderDate || '',
+    status: result?.status || patch.status || existing.status || '',
+    reason: result?.reason || patch.reason || existing.reason || '',
+    replyCategory: result?.replyCategory || patch.replyCategory || existing.replyCategory || '',
+    invoiceFilePath: result?.downloadResult?.path || result?.downloadResult?.existingPath || patch.invoiceFilePath || existing.invoiceFilePath || '',
+    invoiceLink: result?.invoiceLink || patch.invoiceLink || existing.invoiceLink || '',
+    finalUrl: result?.finalUrl || patch.finalUrl || existing.finalUrl || '',
+    checkedAt: result?.checkedAt || patch.checkedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  ledger.orders = { ...(ledger.orders || {}), [orderId]: record };
+  saveChatReplyLedger(ledger);
+  return record;
+}
+
+function loadModifiedLedger() {
+  if (!fs.existsSync(MODIFIED_LEDGER_FILE)) {
+    return { version: '0.1.0', orders: {} };
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(MODIFIED_LEDGER_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return {
+        version: parsed.version || '0.1.0',
+        updatedAt: parsed.updatedAt || '',
+        generatedFromArtifactsAt: parsed.generatedFromArtifactsAt || '',
+        orders: parsed.orders && typeof parsed.orders === 'object' ? parsed.orders : {},
+      };
+    }
+  } catch (error) {
+    console.error(`⚠️  修改/换开台账读取失败，将新建台账: ${error.message}`);
+  }
+  return { version: '0.1.0', orders: {} };
+}
+
+function saveModifiedLedger(ledger) {
+  saveJsonAtomic(MODIFIED_LEDGER_FILE, {
+    version: ledger.version || '0.1.0',
+    updatedAt: new Date().toISOString(),
+    generatedFromArtifactsAt: ledger.generatedFromArtifactsAt || '',
+    orders: ledger.orders || {},
+  });
+}
+
+function getModifiedLedgerRecord(orderId) {
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) return null;
+  const ledger = loadModifiedLedger();
+  return ledger.orders?.[normalizedOrderId] || null;
+}
+
+function recordModifiedOrder(mapping, execution, patch = {}) {
+  const orderId = String(mapping?.bizOrderId || '').trim();
+  if (!orderId) return null;
+  const ledger = loadModifiedLedger();
+  const existing = ledger.orders?.[orderId] || {};
+  const record = {
+    orderId,
+    shopName: mapping.shopName || existing.shopName || '',
+    amount: mapping.amount || existing.amount || '',
+    orderDate: mapping.orderDate || existing.orderDate || '',
+    action: execution?.action || patch.action || existing.action || '',
+    status: execution?.status || patch.status || existing.status || '',
+    reason: execution?.reason || patch.reason || existing.reason || '',
+    submittedAt: execution?.executedAt || patch.submittedAt || existing.submittedAt || new Date().toISOString(),
+    finalUrl: execution?.finalUrl || patch.finalUrl || existing.finalUrl || '',
+    updatedAt: new Date().toISOString(),
+  };
+  ledger.orders = { ...(ledger.orders || {}), [orderId]: record };
+  saveModifiedLedger(ledger);
+  return record;
 }
 
 function getContactedLedgerRecord(orderId) {
@@ -347,9 +665,17 @@ function saveResultsCsv(file, results) {
     'invoice_type',
     'invoice_title',
     'action',
+    'state',
     'status',
+    'page_classification',
+    'matched_rules',
     'failure_reason',
+    'price_diff_amount',
     'invoice_file_path',
+    'chat_reply_category',
+    'chat_invoice_link',
+    'screenshot_path',
+    'html_snapshot_path',
     'processed_at',
   ];
   const rows = [headers.join(',')];
@@ -363,9 +689,17 @@ function saveResultsCsv(file, results) {
       result.invoiceInfo?.invoiceType || '',
       result.invoiceInfo?.invoiceTitle || '',
       result.execution?.action || result.actionPlan?.action || '',
+      result.state || result.execution?.state || '',
       result.execution?.status || result.status || '',
+      result.pageClassification?.category || '',
+      (result.pageClassification?.matchedRules || []).map(rule => rule.id).join('|'),
       result.execution?.reason || result.error || '',
-      result.execution?.downloadResult?.path || '',
+      result.pageClassification?.priceDiff?.amount || result.execution?.pageClassification?.priceDiff?.amount || '',
+      result.execution?.downloadResult?.path || result.execution?.downloadResult?.existingPath || result.execution?.chatReplyResult?.downloadResult?.path || result.execution?.chatReplyResult?.downloadResult?.existingPath || '',
+      result.execution?.chatReplyResult?.replyCategory || result.chatReply?.replyCategory || '',
+      result.execution?.chatReplyResult?.invoiceLink || result.chatReply?.invoiceLink || '',
+      result.artifacts?.screenshotPath || result.execution?.snapshot?.screenshotPath || '',
+      result.artifacts?.htmlSnapshotPath || result.execution?.snapshot?.htmlSnapshotPath || '',
       result.execution?.executedAt || result.checkedAt || '',
     ].map(csvEscape).join(','));
   }
@@ -403,6 +737,18 @@ function buildInvoiceFilename(mapping, inspection, suggestedFilename) {
   return `${base}${ext}`;
 }
 
+function buildChatInvoiceFilename(mapping, suggestedFilename) {
+  const ext = path.extname(suggestedFilename || '') || '.pdf';
+  const base = [
+    mapping.bizOrderId || mapping.orderId || 'unknown_order',
+    mapping.shopName || 'unknown_shop',
+    mapping.amount || 'unknown_amount',
+    'chat_reply_invoice',
+    mapping.orderDate || formatDate(new Date()),
+  ].map(sanitizeFilenamePart).filter(Boolean).join('_');
+  return `${base}${ext}`;
+}
+
 function ensureUniqueFilePath(targetPath) {
   if (!fs.existsSync(targetPath)) return targetPath;
   const ext = path.extname(targetPath);
@@ -425,18 +771,28 @@ function normalizeUrl(href, baseUrl) {
 }
 
 function classifyPageErrorText(text) {
-  const bodyText = String(text || '');
-  const hits = [];
-  for (const [type, patterns] of Object.entries(PAGE_ERROR_HINTS)) {
-    const matched = patterns.find(pattern => bodyText.includes(pattern));
-    if (matched) hits.push({ type, matched });
-  }
+  const parsed = classifyRichPageErrorText(text);
+  const legacyType = {
+    deadline_exceeded: 'expired',
+    wrong_title: 'wrongTitle',
+    wrong_tax_no: 'wrongTaxNo',
+    missing_email: 'missingEmail',
+    missing_supplement_info: 'missingInfo',
+    amount_mismatch: 'amountMismatch',
+    seller_rejected: 'rejected',
+    security_verification: 'verification',
+  };
+  const hits = parsed.hits.map(hit => ({
+    ...hit,
+    type: legacyType[hit.type] || hit.type,
+  }));
   return {
+    ...parsed,
     hits,
-    hasRetryableError: hits.some(hit => ['wrongTitle', 'wrongTaxNo', 'missingEmail', 'missingInfo'].includes(hit.type)),
+    hasRetryableError: hits.some(hit => ['wrongTitle', 'wrongTaxNo', 'missingEmail', 'missingInfo', 'amountMismatch'].includes(hit.type)),
     hasExpiredError: hits.some(hit => hit.type === 'expired'),
-    hasVerificationError: VERIFICATION_TEXT_MARKERS.some(marker => bodyText.includes(marker)),
-    primaryReason: hits[0]?.matched || '',
+    hasVerificationError: parsed.hasVerificationError || VERIFICATION_TEXT_MARKERS.some(marker => String(text || '').includes(marker)),
+    primaryReason: hits[0]?.matched || parsed.primaryReason || '',
   };
 }
 
@@ -551,8 +907,8 @@ function classifyRejectedInvoiceHandling(inspection, history) {
   if (clearlyFixableInForm) {
     if (!hasModifyEntry) {
       return {
-        action: 'manual_required',
-        reason: `拒绝原因看起来可修正，但页面没有可用修改申请入口：${rejectReason || rejectType}`,
+        action: 'contact_seller',
+        reason: `拒绝原因看起来可修正，但页面没有可用修改申请入口，改为联系商家：${rejectReason || rejectType}`,
         rejectInfo,
         parseResult,
       };
@@ -582,7 +938,7 @@ function buildSellerMessage(mapping, invoiceConfig) {
     email: invoiceConfig.email || '无',
   };
 
-  return DEFAULT_SELLER_MESSAGE_TEMPLATE
+  return (invoiceConfig.sellerMessageTemplate || DEFAULT_SELLER_MESSAGE_TEMPLATE)
     .replace(/\{(\w+)\}/g, (_, key) => replacements[key] || '')
     .replace(/\s*\n+\s*/g, ' ')
     .replace(/\s{2,}/g, ' ')
@@ -807,7 +1163,12 @@ function compareArtifactResults(left, right) {
 }
 
 function artifactLooksLikeWrongTitle(node) {
-  const invoiceConfig = loadInvoiceConfig();
+  let invoiceConfig = {};
+  try {
+    invoiceConfig = loadInvoiceConfig();
+  } catch {
+    invoiceConfig = {};
+  }
   const texts = [
     node?.detailBodyText,
     node?.bodyText,
@@ -890,6 +1251,67 @@ function seedContactedLedgerFromArtifacts() {
     ledger.generatedFromArtifactsAt = ledger.generatedFromArtifactsAt || new Date().toISOString();
     saveContactedLedger(ledger);
     console.log(`🧾 已从历史结果补全联系商家台账: ${CONTACTED_LEDGER_FILE}`);
+  }
+}
+
+function seedModifiedLedgerFromArtifacts() {
+  const ledger = loadModifiedLedger();
+  let changed = false;
+  const files = fs.readdirSync(__dirname)
+    .filter(fileName => /^(invoice-action|repair-).*\.(json)$/i.test(fileName))
+    .filter(fileName => !fileName.includes('progress') && fileName !== path.basename(MODIFIED_LEDGER_FILE));
+
+  function visit(node, sourceFile) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach(item => visit(item, sourceFile));
+      return;
+    }
+
+    const orderId = typeof node.bizOrderId === 'string' ? node.bizOrderId : '';
+    const execution = node.execution || {};
+    const action = execution.action || '';
+    const status = execution.status || '';
+    const state = node.state || execution.state || '';
+    if (orderId
+      && ['modify_invoice', 'reissue_invoice'].includes(action)
+      && ['submitted', 'pending'].includes(status)
+      && !ledger.orders?.[orderId]) {
+      ledger.orders = ledger.orders || {};
+      ledger.orders[orderId] = {
+        orderId,
+        shopName: node.shopName || node.orderMeta?.shopName || '',
+        amount: node.amount || node.orderMeta?.amount || '',
+        orderDate: node.orderDate || '',
+        action,
+        status,
+        state,
+        reason: execution.reason || '',
+        submittedAt: execution.executedAt || node.checkedAt || new Date().toISOString(),
+        finalUrl: execution.finalUrl || node.detailUrl || '',
+        source: sourceFile,
+        updatedAt: new Date().toISOString(),
+      };
+      changed = true;
+    }
+
+    for (const value of Object.values(node)) {
+      visit(value, sourceFile);
+    }
+  }
+
+  for (const fileName of files) {
+    try {
+      visit(JSON.parse(fs.readFileSync(path.join(__dirname, fileName), 'utf8')), fileName);
+    } catch {
+      // Ignore partial or obsolete local run artifacts.
+    }
+  }
+
+  if (changed) {
+    ledger.generatedFromArtifactsAt = ledger.generatedFromArtifactsAt || new Date().toISOString();
+    saveModifiedLedger(ledger);
+    console.log(`🧾 已从历史结果补全修改/换开台账: ${MODIFIED_LEDGER_FILE}`);
   }
 }
 
@@ -1221,6 +1643,17 @@ async function closeAuxiliaryPages(context, keepPage) {
 
 async function downloadFirstInvoice(context, page, mapping, preferredType = 'download_invoice', inspection = null) {
   ensureDirectory(DOWNLOAD_DIR);
+  const existingDownload = getDownloadedLedgerRecord(mapping.bizOrderId);
+  if (existingDownload && !cliArgs.forceDownload) {
+    return {
+      status: 'file_exists',
+      reason: '下载台账中已有该订单发票文件，跳过重复下载',
+      filename: existingDownload.filename || path.basename(existingDownload.path || ''),
+      existingPath: existingDownload.path || '',
+      path: existingDownload.path || '',
+    };
+  }
+
   const group = ACTION_KEYWORDS.find(item => item.type === preferredType);
   if (!group) throw new Error(`未知下载动作类型: ${preferredType}`);
 
@@ -1271,12 +1704,15 @@ async function downloadFirstInvoice(context, page, mapping, preferredType = 'dow
         const targetFile = buildInvoiceFilename(mapping, inspection || mapping, suggested);
         const targetPath = ensureUniqueFilePath(path.join(DOWNLOAD_DIR, targetFile));
         await download.saveAs(targetPath);
-        return {
+        const result = {
           status: 'downloaded',
           clickedText: word,
           filename: path.basename(targetPath),
           path: targetPath,
+          downloadedAt: new Date().toISOString(),
         };
+        recordDownloadedInvoice(mapping, result, inspection);
+        return result;
       } finally {
         await closePageQuietly(popup);
       }
@@ -1284,6 +1720,261 @@ async function downloadFirstInvoice(context, page, mapping, preferredType = 'dow
   }
 
   return { status: 'blocked', reason: '没有找到可点击下载入口' };
+}
+
+function buildChatInvoiceDownloadResult(mapping, savedPath, source = {}) {
+  const result = {
+    status: 'downloaded',
+    clickedText: source.text || '',
+    filename: path.basename(savedPath),
+    path: savedPath,
+    downloadedAt: new Date().toISOString(),
+    sourceUrl: source.href || '',
+    sourceText: source.text || '',
+  };
+  recordDownloadedInvoice(mapping, result, {
+    invoiceInfo: {
+      invoiceType: 'chat_reply_invoice',
+      invoiceTitle: '商家聊天回复发票',
+    },
+    orderMeta: {
+      shopName: mapping.shopName || '',
+      amount: mapping.amount || '',
+    },
+  });
+  return result;
+}
+
+async function saveChatDownload(download, mapping, source = {}) {
+  ensureDirectory(DOWNLOAD_DIR);
+  const suggested = download.suggestedFilename();
+  const targetFile = buildChatInvoiceFilename(mapping, suggested);
+  const targetPath = ensureUniqueFilePath(path.join(DOWNLOAD_DIR, targetFile));
+  await download.saveAs(targetPath);
+  return buildChatInvoiceDownloadResult(mapping, targetPath, source);
+}
+
+async function downloadChatInvoiceUrlWithBrowserContext(page, url, mapping, source = {}) {
+  const normalizedUrl = normalizeUrl(url, page.url());
+  if (!normalizedUrl || !/^https?:\/\//i.test(normalizedUrl)) {
+    return { status: 'blocked', reason: '聊天发票链接不是可请求的 HTTP/HTTPS 地址', invoiceLink: normalizedUrl || url };
+  }
+
+  try {
+    const response = await page.request.get(normalizedUrl, {
+      timeout: 20000,
+      maxRedirects: 5,
+    });
+    if (!response.ok()) {
+      return {
+        status: 'manual_required',
+        reason: `发现疑似发票链接，但直接请求失败: HTTP ${response.status()}`,
+        invoiceLink: normalizedUrl,
+      };
+    }
+
+    const buffer = await response.body();
+    if (!buffer || buffer.length < 128) {
+      return {
+        status: 'manual_required',
+        reason: '发现疑似发票链接，但直接请求返回内容过小',
+        invoiceLink: normalizedUrl,
+      };
+    }
+
+    const headers = response.headers();
+    const contentType = headers['content-type'] || '';
+    const disposition = headers['content-disposition'] || '';
+    const dispositionName = decodeURIComponent(
+      disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+      || disposition.match(/filename="?([^";]+)"?/i)?.[1]
+      || ''
+    );
+    const urlPathName = new URL(normalizedUrl).pathname.split('/').pop() || '';
+    const suggested = dispositionName || urlPathName || source.text || 'chat-invoice.pdf';
+    const ext = path.extname(suggested)
+      || (contentType.includes('ofd') ? '.ofd'
+        : contentType.includes('zip') ? '.zip'
+          : contentType.includes('image/') ? `.${contentType.split('/')[1].split(';')[0] || 'jpg'}`
+            : '.pdf');
+    const fileName = path.extname(suggested) ? suggested : `${sanitizeFilenamePart(suggested)}${ext}`;
+    ensureDirectory(DOWNLOAD_DIR);
+    const targetPath = ensureUniqueFilePath(path.join(DOWNLOAD_DIR, buildChatInvoiceFilename(mapping, fileName)));
+    fs.writeFileSync(targetPath, buffer);
+    return buildChatInvoiceDownloadResult(mapping, targetPath, {
+      href: normalizedUrl,
+      text: source.text || source.sourceText || 'direct-request',
+    });
+  } catch (error) {
+    return {
+      status: 'manual_required',
+      reason: `发现疑似发票链接，但直接请求异常: ${error.message}`,
+      invoiceLink: normalizedUrl,
+    };
+  }
+}
+
+function isLikelyInvoiceHref(href = '', text = '') {
+  const normalized = String(href || '').toLowerCase();
+  const label = `${href} ${text}`;
+  if (CHAT_INVOICE_FILE_EXTENSIONS.some(ext => normalized.includes(ext))) return true;
+  return CHAT_INVOICE_LINK_PATTERN.test(label);
+}
+
+function isLikelyChatInvoiceFileText(text = '') {
+  const label = String(text || '').replace(/\s+/g, '');
+  return Boolean(
+    /PDF|OFD|发票|电子票|文件|附件|下载文件|下载附件/i.test(label)
+    || CHAT_INVOICE_FILE_EXTENSIONS.some(ext => label.toLowerCase().includes(ext.slice(1)))
+  );
+}
+
+async function collectChatReplySnapshot(page, invoiceConfig = {}) {
+  const frames = [];
+  for (const scope of getActiveChatScopes(page).slice(0, 10)) {
+    const frame = await scope.evaluate(() => {
+      function isVisible(el) {
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      }
+
+      const bodyText = document.body?.innerText || '';
+      const links = [...document.querySelectorAll('a[href], button, [role="button"], div, span')]
+        .filter(isVisible)
+        .map((el, index) => {
+          const href = el.getAttribute('href') || el.closest('a')?.getAttribute('href') || '';
+          const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          const title = el.getAttribute('title') || '';
+          const ariaLabel = el.getAttribute('aria-label') || '';
+          const downloadName = el.getAttribute('download') || '';
+          const className = typeof el.className === 'string' ? el.className : '';
+          return {
+            index,
+            tag: el.tagName.toLowerCase(),
+            href,
+            text: text.slice(0, 160),
+            title: title.slice(0, 160),
+            ariaLabel: ariaLabel.slice(0, 160),
+            downloadName: downloadName.slice(0, 160),
+            className: className.slice(0, 160),
+          };
+        })
+        .filter(item => item.href
+          || /发票|电子票|附件|文件|下载|查看|pdf|ofd|zip/i.test(`${item.text} ${item.title} ${item.ariaLabel} ${item.downloadName} ${item.className}`))
+        .slice(0, 120);
+
+      return {
+        url: location.href,
+        title: document.title,
+        bodyText,
+        links,
+      };
+    }).catch(error => ({
+      url: scope.url(),
+      title: '',
+      bodyText: '',
+      links: [],
+      error: error.message,
+    }));
+
+    frames.push({
+      frameUrl: scope.url(),
+      ...frame,
+      bodyText: redactSensitiveText(frame.bodyText || '', invoiceConfig),
+    });
+  }
+
+  const combinedText = frames.map(frame => frame.bodyText || '').join('\n');
+  return {
+    capturedAt: new Date().toISOString(),
+    finalUrl: page.url(),
+    title: await page.title().catch(() => ''),
+    bodyText: combinedText,
+    frames,
+  };
+}
+
+function classifyChatReply(snapshot) {
+  const rawText = String(snapshot?.bodyText || '');
+  const compact = rawText.replace(/\s+/g, '');
+  const links = (snapshot?.frames || []).flatMap(frame => (frame.links || []).map(link => ({
+    ...link,
+    frameUrl: frame.frameUrl || frame.url || '',
+  })));
+  const invoiceLinks = links.filter(link => isLikelyInvoiceHref(link.href, `${link.text} ${link.title} ${link.ariaLabel} ${link.downloadName}`));
+  const hasFileCard = isLikelyChatInvoiceFileText(rawText) && /下载文件|下载附件|PDF|OFD|\[文件\]/i.test(rawText);
+
+  if (CHAT_PAYMENT_PATTERN.test(compact)) {
+    const priceDiff = compact.match(/(?:补差|差价|差额|付款|支付|补款)[^0-9]{0,12}([0-9]+(?:\.[0-9]{1,2})?)/);
+    return {
+      replyCategory: 'price_diff_required',
+      status: 'manual_required',
+      state: ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM,
+      reason: priceDiff ? `商家聊天回复要求补差/付款，金额疑似 ${priceDiff[1]}` : '商家聊天回复要求补差/付款',
+      invoiceLinks,
+      priceDiffAmount: priceDiff?.[1] || '',
+    };
+  }
+
+  if (invoiceLinks.length > 0 || hasFileCard) {
+    return {
+      replyCategory: 'invoice_link_found',
+      status: 'can_download',
+      state: ORDER_STATES.CAN_DOWNLOAD,
+      reason: hasFileCard ? '商家聊天回复中发现疑似发票文件卡片' : '商家聊天回复中发现疑似发票附件或下载链接',
+      invoiceLinks,
+      hasFileCard,
+    };
+  }
+
+  if (/已开|开好了|已发送|发票已发|已上传/.test(compact) && /发票|电子票|票据/.test(compact)) {
+    return {
+      replyCategory: 'invoice_claimed_no_link',
+      status: 'manual_required',
+      state: ORDER_STATES.FAILED_RETRYABLE,
+      reason: '商家称已开票/已发送，但未识别到可下载附件或链接',
+      invoiceLinks,
+    };
+  }
+
+  if (CHAT_INFO_REQUEST_PATTERN.test(rawText)) {
+    return {
+      replyCategory: 'seller_requests_info',
+      status: 'manual_required',
+      state: ORDER_STATES.FAILED_RETRYABLE,
+      reason: '商家聊天回复要求补充开票信息',
+      invoiceLinks,
+    };
+  }
+
+  if (CHAT_REJECTION_PATTERN.test(compact)) {
+    return {
+      replyCategory: 'seller_rejected_in_chat',
+      status: 'manual_required',
+      state: ORDER_STATES.FAILED_FINAL,
+      reason: '商家聊天回复表示无法开票或无法补开',
+      invoiceLinks,
+    };
+  }
+
+  if (!compact || compact.length < 20) {
+    return {
+      replyCategory: 'chat_not_loaded',
+      status: 'manual_required',
+      state: ORDER_STATES.FAILED_RETRYABLE,
+      reason: '聊天页面未加载出足够内容',
+      invoiceLinks,
+    };
+  }
+
+  return {
+    replyCategory: 'waiting_or_no_invoice_reply',
+    status: 'waiting',
+    state: ORDER_STATES.CONTACTED_SELLER,
+    reason: '暂未识别到商家发来的发票附件/链接或明确处理要求',
+    invoiceLinks,
+  };
 }
 
 async function clickRadioOrOption(page, texts) {
@@ -1404,6 +2095,119 @@ async function fillByNearbyLabel(page, labelTexts, value, fieldName) {
   }, { labelTexts, value, fieldName }).catch(() => ({ fieldName, filled: false, reason: 'nearby_label_error' }));
 }
 
+async function fillInputByLabelWithPlaywright(page, labelTexts, value, fieldName) {
+  if (!value || labelTexts.length === 0) return { fieldName, filled: false, reason: 'empty_value' };
+
+  const targetMeta = await page.evaluate(({ labelTexts }) => {
+    const inputSelector = 'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea';
+
+    function isVisible(el) {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    }
+
+    function normalize(text) {
+      return (text || '').replace(/\s+/g, '');
+    }
+
+    const allControls = [...document.querySelectorAll(inputSelector)];
+    const controls = allControls
+      .map((el, index) => ({ el, index, rect: el.getBoundingClientRect() }))
+      .filter(item => isVisible(item.el) && !item.el.disabled && item.el.getAttribute('aria-disabled') !== 'true');
+
+    const labelNodes = [...document.querySelectorAll('label, span, div, p, td, th')]
+      .filter(el => isVisible(el))
+      .map(el => ({
+        text: normalize(el.textContent || ''),
+        rect: el.getBoundingClientRect(),
+      }))
+      .filter(item => item.text.length > 0 && item.text.length < 60);
+
+    for (const labelText of labelTexts) {
+      const normalized = normalize(labelText);
+      const labels = labelNodes.filter(item => item.text === normalized || item.text.startsWith(normalized) || item.text.includes(normalized));
+      for (const label of labels) {
+        const candidates = controls
+          .map(control => {
+            const rowAligned = Math.abs((control.rect.top + control.rect.bottom) / 2 - (label.rect.top + label.rect.bottom) / 2) <= 28;
+            const belowLabel = control.rect.top >= label.rect.top - 6 && control.rect.top <= label.rect.bottom + 48;
+            const rightOfLabel = control.rect.left >= label.rect.right - 16;
+            const distance = Math.abs(control.rect.top - label.rect.top) + Math.max(0, control.rect.left - label.rect.right);
+            return { ...control, rowAligned, belowLabel, rightOfLabel, distance };
+          })
+          .filter(control => (control.rowAligned || control.belowLabel) && control.rightOfLabel)
+          .sort((a, b) => a.distance - b.distance);
+
+        const target = candidates[0];
+        if (target) {
+          return {
+            found: true,
+            index: target.index,
+            label: labelText,
+            beforeValue: target.el.value || '',
+          };
+        }
+      }
+    }
+
+    return { found: false };
+  }, { labelTexts }).catch(() => ({ found: false, error: 'label_lookup_error' }));
+
+  if (!targetMeta.found) {
+    return { fieldName, filled: false, reason: targetMeta.error || 'label_input_not_found' };
+  }
+
+  const inputSelector = 'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea';
+  const target = page.locator(inputSelector).nth(targetMeta.index);
+  if (!(await target.isVisible().catch(() => false))) {
+    return { fieldName, filled: false, reason: 'label_input_not_visible', label: targetMeta.label };
+  }
+  await target.click({ timeout: 5000 }).catch(() => null);
+  await target.fill('', { timeout: 5000 }).catch(() => null);
+  await target.fill(value, { timeout: 5000 });
+  await sleep(600);
+  const afterValue = await target.inputValue({ timeout: 1000 }).catch(() => '');
+  return {
+    fieldName,
+    filled: afterValue === value,
+    selector: 'playwright-label',
+    label: targetMeta.label,
+    beforeValue: targetMeta.beforeValue || '',
+    afterValue,
+    reason: afterValue === value ? '' : 'value_reverted_after_fill',
+  };
+}
+
+async function clickInvoiceTitleSuggestion(page, invoiceConfig) {
+  if (!invoiceConfig.companyName) return { clicked: false, reason: 'empty_company_name' };
+  const optionSelectors = [
+    '.search-input-result',
+    '.search-input-result .item',
+    '.next-menu',
+    '.next-menu-item',
+    '.next-menu *',
+    '.next-menu li',
+    '[role="option"]',
+    '[role="menuitem"]',
+    'li',
+  ].join(', ');
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await sleep(700);
+    const locator = page.locator(optionSelectors).filter({ hasText: invoiceConfig.companyName });
+    const count = Math.min(await locator.count().catch(() => 0), 8);
+    for (let i = 0; i < count; i++) {
+      const target = locator.nth(i);
+      if (!(await target.isVisible().catch(() => false))) continue;
+      await target.click({ timeout: 5000 }).catch(() => null);
+      await sleep(1000);
+      return { clicked: true, text: invoiceConfig.companyName, attempt };
+    }
+  }
+  return { clicked: false, reason: 'suggestion_not_found' };
+}
+
 async function fillByExactRowLabel(page, labelTexts, value, fieldName) {
   if (!value || labelTexts.length === 0) return { fieldName, filled: false, reason: 'empty_value' };
 
@@ -1447,7 +2251,7 @@ async function fillByExactRowLabel(page, labelTexts, value, fieldName) {
 
     for (const labelText of labelTexts) {
       const normalized = normalize(labelText);
-      const labels = labelNodes.filter(item => item.text === normalized || item.text.startsWith(normalized));
+      const labels = labelNodes.filter(item => item.text === normalized || item.text.startsWith(normalized) || item.text.includes(normalized));
       for (const label of labels) {
         const candidates = controls
           .map(control => {
@@ -1506,7 +2310,7 @@ async function readValueByExactRowLabel(page, labelTexts, fieldName) {
 
     for (const labelText of labelTexts) {
       const normalized = normalize(labelText);
-      const labels = labelNodes.filter(item => item.text === normalized || item.text.startsWith(normalized));
+      const labels = labelNodes.filter(item => item.text === normalized || item.text.startsWith(normalized) || item.text.includes(normalized));
       for (const label of labels) {
         const candidates = controls
           .map(control => {
@@ -1568,30 +2372,34 @@ async function validateFilledInvoiceForm(page, invoiceConfig) {
   const companyValue = await readValueByExactRowLabel(page, ['发票抬头'], 'companyName');
   const taxValue = await readValueByExactRowLabel(page, ['税号', '纳税人识别号'], 'taxNo');
   const emailValue = await readValueByExactRowLabel(page, ['邮箱', '电子邮箱'], 'email');
+  const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+  const companyActual = companyValue.value || (invoiceConfig.companyName && bodyText.includes(invoiceConfig.companyName) ? invoiceConfig.companyName : '');
+  const taxActual = taxValue.value || (invoiceConfig.taxNo && bodyText.includes(invoiceConfig.taxNo) ? invoiceConfig.taxNo : '');
+  const emailActual = emailValue.value || (invoiceConfig.email && bodyText.includes(invoiceConfig.email) ? invoiceConfig.email : '');
 
   const mismatches = [];
-  if (!companyValue.found || companyValue.value !== invoiceConfig.companyName) {
+  if (companyActual !== invoiceConfig.companyName) {
     mismatches.push({
       fieldName: 'companyName',
       expected: invoiceConfig.companyName,
-      actual: companyValue.value || '',
+      actual: companyActual || '',
     });
   }
-  if (!taxValue.found || taxValue.value !== invoiceConfig.taxNo) {
+  if (taxActual !== invoiceConfig.taxNo) {
     mismatches.push({
       fieldName: 'taxNo',
       expected: invoiceConfig.taxNo,
-      actual: taxValue.value || '',
+      actual: taxActual || '',
     });
   }
 
   return {
     ok: mismatches.length === 0,
     mismatches,
-    companyValue,
-    taxValue,
-    emailValue,
-    emailOk: !invoiceConfig.email || emailValue.value === invoiceConfig.email,
+    companyValue: { ...companyValue, value: companyActual, found: companyValue.found || Boolean(companyActual) },
+    taxValue: { ...taxValue, value: taxActual, found: taxValue.found || Boolean(taxActual) },
+    emailValue: { ...emailValue, value: emailActual, found: emailValue.found || Boolean(emailActual) },
+    emailOk: !invoiceConfig.email || emailActual === invoiceConfig.email,
   };
 }
 
@@ -1599,7 +2407,14 @@ async function fillReissueForm(page, invoiceConfig) {
   await clickRadioOrOption(page, ['企业', '单位', '公司']);
 
   const filledFields = [];
-  let companyField = await fillByExactRowLabel(page, ['发票抬头'], invoiceConfig.companyName, 'companyName');
+  let companyField = await fillInputByLabelWithPlaywright(page, ['发票抬头', '抬头名称', '公司名称', '单位名称'], invoiceConfig.companyName, 'companyName');
+  let titleSuggestion = null;
+  if (companyField.filled) {
+    titleSuggestion = await clickInvoiceTitleSuggestion(page, invoiceConfig);
+  }
+  if (!companyField.filled) {
+    companyField = await fillByExactRowLabel(page, ['发票抬头'], invoiceConfig.companyName, 'companyName');
+  }
   if (!companyField.filled) {
     companyField = await fillFirstVisible(page, [
     'input[placeholder*="发票抬头"]',
@@ -1612,9 +2427,12 @@ async function fillReissueForm(page, invoiceConfig) {
     'input[id*="company" i]',
     ], invoiceConfig.companyName, 'companyName', ['发票抬头', '抬头名称', '公司名称', '单位名称']);
   }
-  filledFields.push(companyField);
+  filledFields.push({ ...companyField, titleSuggestion });
 
-  let taxField = await fillByExactRowLabel(page, ['税号', '纳税人识别号', '统一社会信用代码'], invoiceConfig.taxNo, 'taxNo');
+  let taxField = await fillInputByLabelWithPlaywright(page, ['税号', '纳税人识别号', '统一社会信用代码'], invoiceConfig.taxNo, 'taxNo');
+  if (!taxField.filled) {
+    taxField = await fillByExactRowLabel(page, ['税号', '纳税人识别号', '统一社会信用代码'], invoiceConfig.taxNo, 'taxNo');
+  }
   if (!taxField.filled) {
     taxField = await fillFirstVisible(page, [
     'input[placeholder*="税号"]',
@@ -1684,9 +2502,7 @@ function shouldAutoModify(inspection, history) {
     && (
       inspection?.invoiceInfo?.invoiceType === 'wrong_company_title'
       || parseResult.hasRetryableError
-      || parseResult.hasExpiredError
       || history?.parseResult?.hasRetryableError
-      || history?.parseResult?.hasExpiredError
       || bodyText.includes('商家拒绝')
       || bodyText.includes('修改申请')
       || bodyText.includes('咨询商家')
@@ -1694,8 +2510,19 @@ function shouldAutoModify(inspection, history) {
   );
 }
 
+function invoiceNeedsReissue(inspection, invoiceConfig = {}) {
+  const invoiceType = inspection?.invoiceInfo?.invoiceType || '';
+  const bodyText = inspection?.detailBodyText || '';
+  if (invoiceType === 'personal' || invoiceType === 'wrong_company_title') return true;
+  if (inspection?.pageClassification?.status === ORDER_STATES.NEED_REISSUE) return true;
+  if (invoiceType === 'company' && invoiceConfig.companyName && invoiceConfig.taxNo) {
+    return !bodyText.includes(invoiceConfig.companyName) || !bodyText.includes(invoiceConfig.taxNo);
+  }
+  return false;
+}
+
 async function executeModifyInvoice(context, page, mapping, invoiceConfig, baseInspection = null, baseHistory = null) {
-  const inspection = baseInspection || await inspectOrder(page, mapping);
+  const inspection = baseInspection || await inspectOrder(page, mapping, invoiceConfig);
   if (inspection.status === 'error') {
     return { ...inspection, execution: buildExecutionMeta(inspection, { action: 'modify_invoice', status: 'error', reason: inspection.error, error: inspection.error }) };
   }
@@ -1751,6 +2578,9 @@ async function executeModifyInvoice(context, page, mapping, invoiceConfig, baseI
     }
 
     const submitMeta = await retryableFormSubmit(context, actionPage, mapping, invoiceConfig, inspection, 'modify_invoice');
+    if (['submitted', 'pending'].includes(submitMeta.status)) {
+      recordModifiedOrder(mapping, submitMeta, { action: 'modify_invoice', finalUrl: actionPage.url() });
+    }
     return {
       ...inspection,
       history,
@@ -2337,6 +3167,211 @@ async function sendSellerMessageOnPage(page, mapping, invoiceConfig) {
   return result;
 }
 
+async function clickChatInvoiceLink(context, page, linkCandidate, mapping) {
+  const scopes = getActiveChatScopes(page);
+  const sourceText = linkCandidate.text || linkCandidate.title || linkCandidate.ariaLabel || linkCandidate.downloadName || '';
+  const sourceHref = normalizeUrl(linkCandidate.href || '', linkCandidate.frameUrl || page.url());
+  for (const scope of scopes) {
+    if (sourceHref) {
+      const downloadPromise = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+      const clickedByHref = await withTimeout(scope.evaluate(targetHref => {
+        function normalize(href) {
+          try {
+            return new URL(href.startsWith('//') ? `https:${href}` : href, location.href).href;
+          } catch {
+            return href || '';
+          }
+        }
+
+        const candidates = [...document.querySelectorAll('a[href]')];
+        const target = candidates.find(el => normalize(el.getAttribute('href') || '') === targetHref);
+        if (!target) return false;
+        target.click();
+        return true;
+      }, sourceHref).catch(() => false), 5000, false);
+
+      if (clickedByHref) {
+        const download = await downloadPromise;
+        const popup = await popupPromise;
+        try {
+          if (download) {
+            return await saveChatDownload(download, mapping, {
+              href: sourceHref,
+              text: sourceText,
+            });
+          }
+          if (!popup && sourceHref) {
+            return await downloadChatInvoiceUrlWithBrowserContext(page, sourceHref, mapping, { text: sourceText });
+          }
+          if (popup) {
+            await popup.waitForLoadState('domcontentloaded', { timeout: CONFIG.pageTimeout }).catch(() => null);
+            const popupDownload = await popup.waitForEvent('download', { timeout: 8000 }).catch(() => null);
+            if (popupDownload) {
+              return await saveChatDownload(popupDownload, mapping, {
+                href: popup.url() || sourceHref,
+                text: sourceText,
+              });
+            }
+          }
+        } finally {
+          await closePageQuietly(popup);
+        }
+      }
+    }
+
+    const locator = scope.locator('a[href], button, [role="button"], div, span').filter({ hasText: sourceText || '下载' });
+    const count = Math.min(await locator.count().catch(() => 0), 12);
+    for (let index = 0; index < count; index += 1) {
+      const target = locator.nth(index);
+      if (!(await target.isVisible().catch(() => false))) continue;
+      const meta = await target.evaluate(el => ({
+        href: el.getAttribute('href') || el.closest('a')?.getAttribute('href') || '',
+        text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+        title: el.getAttribute('title') || '',
+        ariaLabel: el.getAttribute('aria-label') || '',
+        downloadName: el.getAttribute('download') || '',
+      })).catch(() => null);
+      const metaHref = normalizeUrl(meta?.href || '', scope.url());
+      const metaLabel = `${meta?.text || ''} ${meta?.title || ''} ${meta?.ariaLabel || ''} ${meta?.downloadName || ''}`;
+      if (sourceHref && metaHref && sourceHref !== metaHref) continue;
+      if (!sourceHref && sourceText && !metaLabel.includes(sourceText.slice(0, Math.min(sourceText.length, 24)))) continue;
+      if (!isLikelyInvoiceHref(metaHref, metaLabel)) continue;
+
+      const downloadPromise = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+      await withTimeout(target.click({ timeout: 8000, noWaitAfter: true }).catch(() => null), 5000, null);
+      const download = await downloadPromise;
+      const popup = await popupPromise;
+      try {
+        if (download) {
+          return await saveChatDownload(download, mapping, {
+            href: metaHref || sourceHref,
+            text: meta?.text || sourceText,
+          });
+        }
+
+        if (popup) {
+          await popup.waitForLoadState('domcontentloaded', { timeout: CONFIG.pageTimeout }).catch(() => null);
+          const popupDownload = await popup.waitForEvent('download', { timeout: 8000 }).catch(() => null);
+          if (popupDownload) {
+            return await saveChatDownload(popupDownload, mapping, {
+              href: popup.url() || metaHref || sourceHref,
+              text: meta?.text || sourceText,
+            });
+          }
+          const popupUrl = popup.url();
+          if (CHAT_INVOICE_FILE_EXTENSIONS.some(ext => popupUrl.toLowerCase().includes(ext))) {
+            return {
+              status: 'manual_required',
+              reason: '聊天链接打开了疑似发票文件页，但未触发浏览器下载事件',
+              invoiceLink: popupUrl,
+            };
+          }
+        }
+
+        if (sourceHref) {
+          return await downloadChatInvoiceUrlWithBrowserContext(page, sourceHref, mapping, { text: meta?.text || sourceText });
+        }
+      } finally {
+        await closePageQuietly(popup);
+      }
+    }
+  }
+
+  if (sourceHref) {
+    return {
+      status: 'manual_required',
+      reason: '发现疑似发票链接，但未能定位到可点击元素',
+      invoiceLink: sourceHref,
+    };
+  }
+  return { status: 'blocked', reason: '未能点击聊天中的疑似发票附件' };
+}
+
+async function clickChatFileDownloadButton(context, page, mapping) {
+  const scopes = getActiveChatScopes(page);
+  for (const scope of scopes) {
+    const scopeText = await scope.evaluate(() => document.body?.innerText || '').catch(() => '');
+    if (!isLikelyChatInvoiceFileText(scopeText)) continue;
+
+    for (const text of CHAT_FILE_DOWNLOAD_TEXTS) {
+      const locator = scope.locator('a, button, [role="button"], div, span').filter({ hasText: text });
+      const count = Math.min(await locator.count().catch(() => 0), 20);
+      for (let index = count - 1; index >= 0; index -= 1) {
+        const target = locator.nth(index);
+        if (!(await target.isVisible().catch(() => false))) continue;
+        const meta = await target.evaluate(el => {
+          const card = el.closest('[class*="file"], [class*="File"], [class*="message"], [class*="Message"], [class*="bubble"], [class*="Bubble"]');
+          return {
+            text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+            cardText: (card?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+            href: el.getAttribute('href') || el.closest('a')?.getAttribute('href') || '',
+            className: typeof el.className === 'string' ? el.className : '',
+          };
+        }).catch(() => null);
+        const label = `${meta?.text || ''} ${meta?.cardText || ''}`;
+        if (!isLikelyChatInvoiceFileText(label) && text === '下载') continue;
+
+        const downloadPromise = page.waitForEvent('download', { timeout: 20000 }).catch(() => null);
+        const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+        await withTimeout(target.click({ timeout: 8000, noWaitAfter: true }).catch(() => null), 5000, null);
+        const download = await downloadPromise;
+        const popup = await popupPromise;
+        try {
+          if (download) {
+            return await saveChatDownload(download, mapping, {
+              href: normalizeUrl(meta?.href || '', scope.url()),
+              text: meta?.cardText || meta?.text || text,
+            });
+          }
+          if (popup) {
+            await popup.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(() => null);
+            const popupDownload = await popup.waitForEvent('download', { timeout: 8000 }).catch(() => null);
+            if (popupDownload) {
+              return await saveChatDownload(popupDownload, mapping, {
+                href: popup.url(),
+                text: meta?.cardText || meta?.text || text,
+              });
+            }
+          }
+        } finally {
+          await closePageQuietly(popup);
+        }
+      }
+    }
+  }
+
+  return { status: 'blocked', reason: '未找到可点击的聊天文件下载按钮' };
+}
+
+async function downloadInvoiceFromChatReply(context, page, mapping, chatReply) {
+  const existingDownload = getDownloadedLedgerRecord(mapping.bizOrderId);
+  if (existingDownload && !cliArgs.forceDownload) {
+    return {
+      status: 'file_exists',
+      reason: '下载台账中已有该订单发票文件，跳过聊天附件重复下载',
+      filename: existingDownload.filename || path.basename(existingDownload.path || ''),
+      existingPath: existingDownload.path || '',
+      path: existingDownload.path || '',
+    };
+  }
+
+  const fileButtonResult = await clickChatFileDownloadButton(context, page, mapping);
+  if (['downloaded', 'file_exists'].includes(fileButtonResult.status)) {
+    return fileButtonResult;
+  }
+
+  for (const link of chatReply.invoiceLinks || []) {
+    const result = await clickChatInvoiceLink(context, page, link, mapping);
+    if (['downloaded', 'file_exists', 'manual_required'].includes(result.status)) {
+      return result;
+    }
+  }
+
+  return { status: 'blocked', reason: '未能下载聊天中的疑似发票附件或链接' };
+}
+
 async function openOrderInListPage(page, orderId) {
   const normalizedOrderId = String(orderId || '').trim();
   if (!normalizedOrderId) {
@@ -2410,11 +3445,11 @@ async function clickSellerContactInOrderCard(context, page, orderId) {
     const href = await target.getAttribute('href').catch(() => '');
     const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
     console.log(`    [联系商家] 尝试点击订单卡片卖家入口: ${selector}`);
-    await target.click({ timeout: 8000 }).catch(() => null);
+    await withTimeout(target.click({ timeout: 8000, noWaitAfter: true }).catch(() => null), 5000, null);
     const popup = await popupPromise;
     const actionPage = popup || page;
-    await actionPage.waitForLoadState('domcontentloaded', { timeout: CONFIG.pageTimeout }).catch(() => null);
-    await waitForContactPageReady(actionPage).catch(() => null);
+    await withTimeout(actionPage.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(() => null), 13000, null);
+    await withTimeout(waitForContactPageReady(actionPage, 12000).catch(() => null), 13000, null);
     return {
       page: actionPage,
       openedPopup: Boolean(popup),
@@ -2488,6 +3523,150 @@ async function tryContactSellerFromOrderList(context, page, mapping, invoiceConf
   } finally {
     if (clickResult.openedPopup) {
       await closePageQuietly(actionPage);
+    }
+  }
+}
+
+async function openSellerChatFromLedgerOrOrder(context, page, mapping) {
+  const contactedRecord = getContactedLedgerRecord(mapping.bizOrderId);
+  const attempts = [];
+  const ledgerUrl = contactedRecord?.finalUrl || '';
+  if (ledgerUrl && !looksLikePlatformCustomerService(ledgerUrl) && !isTradeDetailUrl(ledgerUrl) && !ledgerUrl.includes('invoice-ua.taobao.com')) {
+    console.log(`    [聊天回访] 尝试打开台账聊天页: ${ledgerUrl}`);
+    await page.goto(ledgerUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeout }).catch(error => {
+      attempts.push({ source: 'contacted-ledger', reason: error.message, finalUrl: ledgerUrl });
+    });
+    await waitForContactPageReady(page, 15000).catch(() => null);
+    const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+    if (!isLoginOrVerifyUrl(page.url()) && !looksLikePlatformCustomerService(page.url()) && /发送|聊天|消息|旺旺|发票|附件|文件|pdf|ofd/i.test(bodyText)) {
+      return { page, openedPopup: false, source: 'contacted-ledger', attempts };
+    }
+    attempts.push({ source: 'contacted-ledger', reason: '台账 URL 未打开可读商家聊天页', finalUrl: page.url() });
+  }
+
+  const openResult = await openOrderInListPage(page, mapping.bizOrderId);
+  if (!openResult.found) {
+    attempts.push({ source: '订单列表页', reason: openResult.reason || '未找到目标订单', finalUrl: page.url() });
+    return {
+      status: 'manual_required',
+      reason: summarizeContactAttempts(attempts, '未能定位订单以打开商家聊天'),
+      attempts,
+      finalUrl: page.url(),
+    };
+  }
+
+  const clickResult = await clickSellerContactInOrderCard(context, page, mapping.bizOrderId).catch(() => null);
+  if (!clickResult) {
+    attempts.push({ source: '订单列表页', reason: '未找到旺旺/商家联系入口', finalUrl: page.url() });
+    return {
+      status: 'manual_required',
+      reason: summarizeContactAttempts(attempts, '未找到商家聊天入口'),
+      attempts,
+      finalUrl: page.url(),
+    };
+  }
+
+  return { ...clickResult, source: '订单列表页', attempts };
+}
+
+async function inspectSellerChatReply(context, page, mapping, invoiceConfig) {
+  console.log(`    [聊天回访] 检查订单 ${mapping.bizOrderId}`);
+  const existingReply = getChatReplyLedgerRecord(mapping.bizOrderId);
+  if (existingReply?.invoiceFilePath && fs.existsSync(existingReply.invoiceFilePath) && !cliArgs.forceDownload) {
+    return {
+      status: 'file_exists',
+      replyCategory: existingReply.replyCategory || 'invoice_downloaded_from_chat',
+      reason: '聊天回访台账已有发票文件，跳过重复下载',
+      invoiceFilePath: existingReply.invoiceFilePath,
+      finalUrl: existingReply.finalUrl || page.url(),
+      checkedAt: new Date().toISOString(),
+      downloadResult: {
+        status: 'file_exists',
+        existingPath: existingReply.invoiceFilePath,
+        path: existingReply.invoiceFilePath,
+        filename: path.basename(existingReply.invoiceFilePath),
+      },
+    };
+  }
+
+  const openResult = await openSellerChatFromLedgerOrOrder(context, page, mapping);
+  if (openResult.status === 'manual_required') {
+    const result = {
+      status: 'manual_required',
+      replyCategory: 'chat_open_failed',
+      reason: openResult.reason,
+      attempts: openResult.attempts || [],
+      finalUrl: openResult.finalUrl || page.url(),
+      checkedAt: new Date().toISOString(),
+    };
+    recordChatReplyOrder(mapping, result);
+    return result;
+  }
+
+  const chatPage = openResult.page;
+  try {
+    const verification = await handleVerificationIfNeeded(chatPage, '聊天回访前需要安全验证');
+    if (verification.blocked) {
+      const result = {
+        status: 'manual_required',
+        replyCategory: 'security_verification',
+        state: ORDER_STATES.NEED_MANUAL_SECURITY_CHECK,
+        reason: verification.reason,
+        finalUrl: chatPage.url(),
+        checkedAt: new Date().toISOString(),
+      };
+      recordChatReplyOrder(mapping, result);
+      return result;
+    }
+
+    await dismissKnownChatHints(chatPage).catch(() => null);
+    await waitForContactPageReady(chatPage, 12000).catch(() => null);
+    const snapshot = await collectChatReplySnapshot(chatPage, invoiceConfig);
+    const reply = classifyChatReply(snapshot);
+    let downloadResult = null;
+
+    if (reply.status === 'can_download') {
+      downloadResult = await downloadInvoiceFromChatReply(context, chatPage, mapping, reply);
+      const result = {
+        status: downloadResult.status === 'downloaded' || downloadResult.status === 'file_exists' ? downloadResult.status : 'manual_required',
+        replyCategory: downloadResult.status === 'downloaded' || downloadResult.status === 'file_exists'
+          ? 'invoice_downloaded_from_chat'
+          : reply.replyCategory,
+        state: downloadResult.status === 'downloaded' || downloadResult.status === 'file_exists'
+          ? ORDER_STATES.DOWNLOADED
+          : ORDER_STATES.FAILED_RETRYABLE,
+        reason: downloadResult.reason || reply.reason,
+        invoiceLink: downloadResult.invoiceLink || reply.invoiceLinks?.[0]?.href || '',
+        downloadResult,
+        chatReply: {
+          ...reply,
+          invoiceLinks: reply.invoiceLinks?.slice(0, 8) || [],
+        },
+        finalUrl: chatPage.url(),
+        checkedAt: new Date().toISOString(),
+      };
+      recordChatReplyOrder(mapping, result);
+      return result;
+    }
+
+    const result = {
+      status: reply.status === 'waiting' ? 'chat_waiting_reply' : reply.status,
+      replyCategory: reply.replyCategory,
+      state: reply.state,
+      reason: reply.reason,
+      invoiceLink: reply.invoiceLinks?.[0]?.href || '',
+      chatReply: {
+        ...reply,
+        invoiceLinks: reply.invoiceLinks?.slice(0, 8) || [],
+      },
+      finalUrl: chatPage.url(),
+      checkedAt: new Date().toISOString(),
+    };
+    recordChatReplyOrder(mapping, result);
+    return result;
+  } finally {
+    if (openResult.openedPopup) {
+      await closePageQuietly(chatPage);
     }
   }
 }
@@ -2659,7 +3838,7 @@ async function clickSubmitInvoiceForm(page) {
 }
 
 function buildExecutionMeta(base, patch = {}) {
-  return {
+  const execution = {
     action: base.actionPlan?.action || '',
     status: patch.status || 'unknown',
     reason: patch.reason || '',
@@ -2668,6 +3847,71 @@ function buildExecutionMeta(base, patch = {}) {
     executedAt: patch.executedAt || new Date().toISOString(),
     ...patch,
   };
+  return {
+    ...execution,
+    state: patch.state || deriveStateFromExecution(execution, base.state || ORDER_STATES.CHECKING),
+  };
+}
+
+function getMatchedRuleIds(classification) {
+  return (classification?.matchedRules || []).map(rule => rule.id).filter(Boolean);
+}
+
+function buildInspectionTrace(state, classification, action = 'classify_page') {
+  const trace = createOrderTrace(ORDER_STATES.PENDING);
+  appendStateEvent(trace, {
+    to: ORDER_STATES.CHECKING,
+    action: 'inspect_order',
+    reason: '打开订单发票页并读取页面',
+  });
+  appendStateEvent(trace, {
+    to: state,
+    action,
+    reason: classification?.rawPrompt || classification?.category || '',
+    category: classification?.category || '',
+    matchedRules: getMatchedRuleIds(classification),
+  });
+  return trace;
+}
+
+function finalizeOrderResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  const fallbackState = deriveStateFromClassification(result.pageClassification, result.state || ORDER_STATES.CHECKING);
+  const finalState = result.execution?.state || fallbackState;
+  const trace = result.stateTrace && Array.isArray(result.stateTrace.events)
+    ? result.stateTrace
+    : buildInspectionTrace(fallbackState, result.pageClassification, result.actionPlan?.action || 'classify_page');
+  if (result.execution) {
+    appendStateEvent(trace, {
+      to: finalState,
+      action: result.execution.action || result.actionPlan?.action || '',
+      reason: result.execution.reason || '',
+      category: result.pageClassification?.category || result.execution.pageClassification?.category || '',
+      matchedRules: getMatchedRuleIds(result.pageClassification || result.execution.pageClassification),
+      retry: Number(result.execution.retries || 0) > 0,
+    });
+  }
+  result.state = finalState;
+  result.stateTrace = trace;
+  return result;
+}
+
+function shouldCaptureResultSnapshot(result) {
+  const state = result?.execution?.state || result?.state || '';
+  const status = result?.execution?.status || result?.status || '';
+  const category = result?.pageClassification?.category || result?.execution?.pageClassification?.category || '';
+  return Boolean(
+    status === 'error'
+    || status === 'blocked'
+    || status === 'manual_required'
+    || state === ORDER_STATES.FAILED_RETRYABLE
+    || state === ORDER_STATES.FAILED_FINAL
+    || state === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK
+    || state === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM
+    || state === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM
+    || category === 'unknown_error'
+    || category === 'download_failed'
+  );
 }
 
 async function handleVerificationIfNeeded(page, reason) {
@@ -2718,7 +3962,27 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
 
     submitResult = await clickSubmitInvoiceForm(page);
     const afterText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
+    const afterClassification = classifyInvoicePage({
+      text: afterText,
+      url: page.url(),
+      title: await page.title().catch(() => ''),
+      invoiceInfo: inspection.invoiceInfo,
+      candidates: await collectActionCandidates(page).catch(() => []),
+    }, { invoiceConfig });
     const parsedError = classifyPageErrorText(afterText);
+    if (afterClassification.status === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM || afterClassification.status === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) {
+      return buildExecutionMeta(inspection, {
+        action: mode,
+        status: 'manual_required',
+        state: afterClassification.status,
+        retries,
+        fillResult,
+        submitResult,
+        pageClassification: afterClassification,
+        priceDiff: afterClassification.priceDiff,
+        reason: afterClassification.manualReason || afterClassification.rawPrompt || '页面提示补差或金额差异',
+      });
+    }
     if (parsedError.hasRetryableError && retries < CONFIG.maxRetries) {
       retries += 1;
       lastReason = parsedError.primaryReason || '提交后页面提示可修正错误';
@@ -2731,6 +3995,7 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
         retries,
         fillResult,
         submitResult,
+        pageClassification: afterClassification,
         reason: parsedError.primaryReason || '页面提示超过开票期限',
       });
     }
@@ -2741,7 +4006,9 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
         retries,
         fillResult,
         submitResult,
+        pageClassification: afterClassification,
         reason: parsedError.primaryReason || '提交后需要人工验证',
+        state: ORDER_STATES.NEED_MANUAL_SECURITY_CHECK,
       });
     }
 
@@ -2752,6 +4019,7 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
       retries,
       fillResult,
       submitResult,
+      pageClassification: afterClassification,
       successHint: successHint || '',
       reason: submitResult.submitted ? (successHint || '已提交') : '未找到提交按钮',
       finalUrl: page.url(),
@@ -2769,9 +4037,33 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
 }
 
 async function executeApplyInvoice(context, page, mapping, invoiceConfig) {
-  const inspection = await inspectOrder(page, mapping);
+  const inspection = await inspectOrder(page, mapping, invoiceConfig);
   if (inspection.status === 'error') {
     return { ...inspection, execution: buildExecutionMeta(inspection, { action: 'apply_invoice', status: 'error', reason: inspection.error, error: inspection.error }) };
+  }
+  if (inspection.pageClassification?.status === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) {
+    return {
+      ...inspection,
+      execution: buildExecutionMeta(inspection, {
+        action: 'apply_invoice',
+        status: 'manual_required',
+        state: ORDER_STATES.NEED_MANUAL_SECURITY_CHECK,
+        reason: inspection.pageClassification.manualReason || '页面需要人工安全验证',
+      }),
+    };
+  }
+  if ([ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM, ORDER_STATES.NEED_PRICE_DIFF_CONFIRM].includes(inspection.pageClassification?.status)) {
+    return {
+      ...inspection,
+      execution: buildExecutionMeta(inspection, {
+        action: 'apply_invoice',
+        status: 'manual_required',
+        state: inspection.pageClassification.status,
+        pageClassification: inspection.pageClassification,
+        priceDiff: inspection.pageClassification.priceDiff,
+        reason: inspection.pageClassification.manualReason || inspection.pageClassification.rawPrompt || '页面提示补差或金额差异',
+      }),
+    };
   }
 
   const hasApplyCandidate = inspection.candidates?.some(candidate => candidate.type === 'apply_invoice' && candidate.visible && !candidate.disabled);
@@ -2819,6 +4111,86 @@ async function executeApplyInvoice(context, page, mapping, invoiceConfig) {
 
     const existingApplication = await detectExistingInvoiceApplication(actionPage, invoiceConfig);
     if (existingApplication.exists) {
+      if (existingApplication.titleLooksLikeTaxNo) {
+        const actionBodyText = await actionPage.evaluate(() => document.body.innerText || '').catch(() => '');
+        const normalizedPostCandidates = postClickCandidates.map(candidate => ({
+          ...candidate,
+          href: normalizeUrl(candidate.href, actionPage.url()),
+        }));
+        const repairInspection = {
+          ...inspection,
+          detailUrl: actionPage.url(),
+          detailBodyText: actionBodyText,
+          candidates: normalizedPostCandidates,
+          invoiceInfo: {
+            invoiceType: 'wrong_company_title',
+            invoiceTitle: '错抬头-疑似税号',
+            confidence: 'high',
+          },
+          pageClassification: classifyInvoicePage({
+            text: actionBodyText,
+            url: actionPage.url(),
+            title: await actionPage.title().catch(() => ''),
+            candidates: normalizedPostCandidates,
+            invoiceInfo: {
+              invoiceType: 'wrong_company_title',
+              invoiceTitle: '错抬头-疑似税号',
+              confidence: 'high',
+            },
+          }, { invoiceConfig }),
+          actionPlan: normalizedPostCandidates.some(candidate => candidate.type === 'modify_invoice' && candidate.visible && !candidate.disabled)
+            ? { action: 'modify_invoice', confidence: 'high', reason: existingApplication.reason }
+            : { action: 'contact_seller', confidence: 'medium', reason: existingApplication.reason },
+        };
+
+        if (repairInspection.actionPlan.action === 'modify_invoice') {
+          const history = await inspectHistory(context, actionPage);
+          const modifyResult = await executeModifyInvoice(context, actionPage, mapping, invoiceConfig, repairInspection, history);
+          return {
+            ...modifyResult,
+            execution: {
+              ...(modifyResult.execution || {}),
+              originalAction: 'apply_invoice',
+              existingApplication,
+              clickedText: modifyResult.execution?.clickedText || clickResult.clickedText,
+              openedPopup: clickResult.openedPopup || Boolean(modifyResult.execution?.openedPopup),
+            },
+          };
+        }
+
+        const modifiedRecord = getModifiedLedgerRecord(mapping.bizOrderId);
+        if (modifiedRecord) {
+          return {
+            ...repairInspection,
+            execution: buildExecutionMeta(repairInspection, {
+              action: 'modify_invoice',
+              status: 'pending',
+              state: ORDER_STATES.APPLIED_WAITING,
+              existingApplication,
+              modifiedRecord,
+              finalUrl: actionPage.url(),
+              reason: '本地台账显示已提交过修改申请，等待商家处理，跳过重复修改/联系商家',
+            }),
+          };
+        }
+
+        const contactResult = await contactSellerForInvoice(context, actionPage, {
+          ...mapping,
+          contactReason: existingApplication.reason,
+        }, invoiceConfig);
+        return {
+          ...repairInspection,
+          execution: buildExecutionMeta(repairInspection, {
+            action: 'contact_seller',
+            status: contactResult.status === 'seller_contacted' ? 'seller_contacted' : 'manual_required',
+            existingApplication,
+            contactResult,
+            finalUrl: contactResult.finalUrl || actionPage.url(),
+            reason: contactResult.reason || existingApplication.reason,
+          }),
+        };
+      }
+
       return {
         ...inspection,
         execution: buildExecutionMeta(inspection, {
@@ -2868,8 +4240,8 @@ async function executeApplyInvoice(context, page, mapping, invoiceConfig) {
   }
 }
 
-async function executeDownloadInvoice(context, page, mapping) {
-  const inspection = await inspectOrder(page, mapping);
+async function executeDownloadInvoice(context, page, mapping, invoiceConfig = {}) {
+  const inspection = await inspectOrder(page, mapping, invoiceConfig);
   if (inspection.status === 'error') {
     return { ...inspection, execution: buildExecutionMeta(inspection, { action: 'download_invoice', status: 'error', reason: inspection.error, error: inspection.error }) };
   }
@@ -2922,19 +4294,19 @@ async function executeDownloadInvoice(context, page, mapping) {
 }
 
 async function executeReissue(context, page, mapping, invoiceConfig) {
-  const inspection = await inspectOrder(page, mapping);
+  const inspection = await inspectOrder(page, mapping, invoiceConfig);
   if (inspection.status === 'error') {
     return { ...inspection, execution: buildExecutionMeta(inspection, { action: 'reissue_invoice', status: 'error', reason: inspection.error, error: inspection.error }) };
   }
 
   const hasReissueCandidate = inspection.candidates?.some(candidate => candidate.type === 'reissue_invoice' && candidate.visible && !candidate.disabled);
-  if (inspection.invoiceInfo?.invoiceType !== 'personal') {
+  if (!invoiceNeedsReissue(inspection, invoiceConfig)) {
     return {
       ...inspection,
       execution: buildExecutionMeta(inspection, {
         action: 'reissue_invoice',
         status: 'skipped',
-        reason: `只自动换开明确识别为个人发票的订单，当前为 ${inspection.invoiceInfo?.invoiceType || 'unknown'}`,
+        reason: `当前发票信息未被识别为需要换开，当前为 ${inspection.invoiceInfo?.invoiceType || 'unknown'}`,
       }),
     };
   }
@@ -2954,6 +4326,9 @@ async function executeReissue(context, page, mapping, invoiceConfig) {
     }
 
     const submitMeta = await retryableFormSubmit(context, actionPage, mapping, invoiceConfig, inspection, 'reissue_invoice');
+    if (['submitted', 'pending'].includes(submitMeta.status)) {
+      recordModifiedOrder(mapping, submitMeta, { action: 'reissue_invoice', finalUrl: actionPage.url() });
+    }
 
     return {
       ...inspection,
@@ -2961,6 +4336,7 @@ async function executeReissue(context, page, mapping, invoiceConfig) {
         ...submitMeta,
         clickedText: clickResult.clickedText,
         openedPopup: clickResult.openedPopup,
+        originalInvoiceInfo: inspection.invoiceInfo || null,
       },
     };
   } finally {
@@ -2970,7 +4346,66 @@ async function executeReissue(context, page, mapping, invoiceConfig) {
   }
 }
 
+async function executeChatFollowup(context, page, mapping, invoiceConfig) {
+  const chatReplyResult = await inspectSellerChatReply(context, page, mapping, invoiceConfig);
+  const base = {
+    status: 'ok',
+    ...mapping,
+    detailUrl: chatReplyResult.finalUrl || page.url(),
+    pageTitle: '商家聊天回访',
+    detailBodyText: '',
+    orderMeta: {
+      shopName: mapping.shopName || '',
+      amount: mapping.amount || '',
+    },
+    invoiceInfo: {
+      invoiceType: chatReplyResult.status === 'downloaded' || chatReplyResult.status === 'file_exists'
+        ? 'chat_reply_invoice'
+        : 'unknown',
+      invoiceTitle: chatReplyResult.replyCategory || '商家聊天回访',
+      confidence: 'medium',
+    },
+    pageClassification: {
+      category: chatReplyResult.replyCategory || 'seller_chat_followup',
+      status: chatReplyResult.state || ORDER_STATES.CONTACTED_SELLER,
+      recommendedAction: chatReplyResult.status === 'downloaded' || chatReplyResult.status === 'file_exists' ? 'skip_download' : 'wait',
+      matchedRules: [],
+      rawPrompt: chatReplyResult.reason || '',
+    },
+    actionPlan: {
+      action: 'chat_followup',
+      confidence: 'medium',
+      reason: '回访已联系商家的聊天窗口，识别商家旁路回复',
+    },
+    chatReply: chatReplyResult.chatReply || null,
+    state: chatReplyResult.state || ORDER_STATES.CONTACTED_SELLER,
+    stateTrace: buildInspectionTrace(chatReplyResult.state || ORDER_STATES.CONTACTED_SELLER, {
+      category: chatReplyResult.replyCategory || 'seller_chat_followup',
+      rawPrompt: chatReplyResult.reason || '',
+      matchedRules: [],
+    }, 'chat_followup'),
+    checkedAt: chatReplyResult.checkedAt || new Date().toISOString(),
+  };
+
+  return {
+    ...base,
+    execution: buildExecutionMeta(base, {
+      action: 'chat_followup',
+      status: chatReplyResult.status,
+      state: chatReplyResult.state,
+      reason: chatReplyResult.reason,
+      chatReplyResult,
+      downloadResult: chatReplyResult.downloadResult || null,
+      finalUrl: chatReplyResult.finalUrl || page.url(),
+      executedAt: chatReplyResult.checkedAt || new Date().toISOString(),
+    }),
+  };
+}
+
 async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
+  if (cliArgs.action === 'chat') {
+    return executeChatFollowup(context, page, mapping, invoiceConfig);
+  }
   if (cliArgs.action === 'apply') {
     return executeApplyInvoice(context, page, mapping, invoiceConfig);
   }
@@ -2978,12 +4413,36 @@ async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
     return executeReissue(context, page, mapping, invoiceConfig);
   }
   if (cliArgs.action === 'download') {
-    return executeDownloadInvoice(context, page, mapping);
+    return executeDownloadInvoice(context, page, mapping, invoiceConfig);
   }
 
-  const inspection = await inspectOrder(page, mapping);
+  const inspection = await inspectOrder(page, mapping, invoiceConfig);
   if (inspection.status === 'error') {
     return { ...inspection, execution: buildExecutionMeta(inspection, { action: 'all', status: 'error', reason: inspection.error, error: inspection.error }) };
+  }
+  if (inspection.pageClassification?.status === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) {
+    return {
+      ...inspection,
+      execution: buildExecutionMeta(inspection, {
+        action: 'manual_security_check',
+        status: 'manual_required',
+        state: ORDER_STATES.NEED_MANUAL_SECURITY_CHECK,
+        reason: inspection.pageClassification.manualReason || '页面需要人工安全验证',
+      }),
+    };
+  }
+  if ([ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM, ORDER_STATES.NEED_PRICE_DIFF_CONFIRM].includes(inspection.pageClassification?.status)) {
+    return {
+      ...inspection,
+      execution: buildExecutionMeta(inspection, {
+        action: 'manual_payment_or_price_diff',
+        status: 'manual_required',
+        state: inspection.pageClassification.status,
+        pageClassification: inspection.pageClassification,
+        priceDiff: inspection.pageClassification.priceDiff,
+        reason: inspection.pageClassification.manualReason || inspection.pageClassification.rawPrompt || '页面提示补差或金额差异',
+      }),
+    };
   }
   const history = await inspectHistory(context, page);
   const rejectedDecision = classifyRejectedInvoiceHandling(inspection, history);
@@ -3028,8 +4487,25 @@ async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
       execution: buildExecutionMeta(inspection, { action: 'manual_review', status: 'manual_required', reason: inspection.actionPlan.reason }),
     };
   }
+  if (inspection.actionPlan?.action === 'contact_seller') {
+    const contactResult = await contactSellerForInvoice(context, page, {
+      ...mapping,
+      contactReason: inspection.actionPlan.reason,
+    }, invoiceConfig);
+    return {
+      ...inspection,
+      history,
+      execution: buildExecutionMeta(inspection, {
+        action: 'contact_seller',
+        status: contactResult.status === 'seller_contacted' ? 'seller_contacted' : 'manual_required',
+        contactResult,
+        finalUrl: contactResult.finalUrl || page.url(),
+        reason: contactResult.reason || inspection.actionPlan.reason,
+      }),
+    };
+  }
   if (inspection.actionPlan?.action === 'download_invoice' || inspection.actionPlan?.action === 'inspect_invoice') {
-    return executeDownloadInvoice(context, page, mapping);
+    return executeDownloadInvoice(context, page, mapping, invoiceConfig);
   }
   if (inspection.actionPlan?.action === 'reissue_invoice') {
     return executeReissue(context, page, mapping, invoiceConfig);
@@ -3047,9 +4523,30 @@ async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
   };
 }
 
-function chooseRecommendedAction(invoiceInfo, candidates) {
+function chooseRecommendedAction(invoiceInfo, candidates, pageClassification = null) {
   const visibleEnabled = candidates.filter(c => c.visible && !c.disabled);
   const byType = type => visibleEnabled.find(c => c.type === type);
+
+  if (pageClassification?.status === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) {
+    return { action: 'manual_review', confidence: 'high', reason: pageClassification.manualReason || '页面需要人工安全验证' };
+  }
+  if (pageClassification?.status === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM || pageClassification?.status === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) {
+    return { action: 'manual_review', confidence: 'high', reason: pageClassification.manualReason || pageClassification.rawPrompt || '页面提示补差或金额差异' };
+  }
+  if (pageClassification?.recommendedAction === 'contact_seller') {
+    return { action: 'contact_seller', confidence: 'high', reason: pageClassification.rawPrompt || '页面提示需要联系商家处理' };
+  }
+  if (['wrong_title', 'wrong_tax_no', 'invoice_info_mismatch'].includes(pageClassification?.category)) {
+    if (byType('modify_invoice')) return { action: 'modify_invoice', confidence: 'high', reason: pageClassification.rawPrompt || '发票信息不符合配置，发现修改申请入口' };
+    if (byType('reissue_invoice')) return { action: 'reissue_invoice', confidence: 'high', reason: pageClassification.rawPrompt || '发票信息不符合配置，发现换开入口' };
+    return { action: 'contact_seller', confidence: 'medium', reason: '发票信息不符合配置，但未发现修改/换开入口，改为联系商家' };
+  }
+  if (pageClassification?.recommendedAction === 'apply_invoice' && byType('apply_invoice')) {
+    return { action: 'apply_invoice', confidence: 'high', reason: pageClassification.rawPrompt || '页面识别为可申请开票' };
+  }
+  if (pageClassification?.recommendedAction === 'download_invoice' && byType('download_invoice')) {
+    return { action: 'download_invoice', confidence: 'high', reason: pageClassification.rawPrompt || '页面识别为可下载发票' };
+  }
 
   if (invoiceInfo.invoiceType === 'wrong_company_title' && byType('modify_invoice')) {
     return { action: 'modify_invoice', confidence: 'high', reason: '发票抬头像税号，发现修改申请入口' };
@@ -3058,7 +4555,7 @@ function chooseRecommendedAction(invoiceInfo, candidates) {
     return { action: 'reissue_invoice', confidence: 'high', reason: '发票抬头像税号，发现换开入口' };
   }
   if (invoiceInfo.invoiceType === 'wrong_company_title') {
-    return { action: 'manual_review', confidence: 'high', reason: '发票抬头像税号，但未发现修改/换开入口，不能按普通下载完成' };
+    return { action: 'contact_seller', confidence: 'medium', reason: '发票抬头像税号，但未发现修改/换开入口，改为联系商家' };
   }
   if (invoiceInfo.invoiceType === 'personal' && byType('reissue_invoice')) {
     return { action: 'reissue_invoice', confidence: 'medium', reason: '个人发票且发现换开入口' };
@@ -3078,7 +4575,7 @@ function chooseRecommendedAction(invoiceInfo, candidates) {
   return { action: 'no_action', confidence: 'none', reason: '未发现可操作发票入口' };
 }
 
-async function inspectOrder(page, mapping) {
+async function inspectOrder(page, mapping, invoiceConfig = {}) {
   try {
     await page.goto(mapping.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeout });
     await page.waitForLoadState('networkidle', { timeout: CONFIG.detailWaitTimeout }).catch(() => null);
@@ -3087,6 +4584,7 @@ async function inspectOrder(page, mapping) {
     try { await page.click('text=知道了', { timeout: 1500 }); } catch {}
 
     const bodyText = await page.evaluate(() => document.body.innerText || '');
+    const pageTitle = await page.title().catch(() => '');
     const invoiceInfo = classifyInvoiceText(bodyText);
     const orderMeta = await page.evaluate(() => {
       const bodyText = document.body?.innerText || '';
@@ -3098,27 +4596,48 @@ async function inspectOrder(page, mapping) {
       };
     }).catch(() => ({ amount: '', shopName: '' }));
     const candidates = await collectActionCandidates(page);
-    const actionPlan = chooseRecommendedAction(invoiceInfo, candidates);
+    const normalizedCandidates = candidates.map(candidate => ({
+      ...candidate,
+      href: normalizeUrl(candidate.href, page.url()),
+    }));
+    const pageClassification = classifyInvoicePage({
+      text: bodyText,
+      url: page.url(),
+      title: pageTitle,
+      candidates: normalizedCandidates,
+      invoiceInfo,
+    }, { invoiceConfig });
+    const actionPlan = chooseRecommendedAction(invoiceInfo, normalizedCandidates, pageClassification);
+    const state = deriveStateFromClassification(pageClassification, ORDER_STATES.CHECKING);
 
     return {
       status: 'ok',
       ...mapping,
       detailUrl: page.url(),
+      pageTitle,
       detailBodyText: bodyText,
       orderMeta,
       invoiceInfo,
+      pageClassification,
+      state,
+      stateTrace: buildInspectionTrace(state, pageClassification, actionPlan.action),
       actionPlan,
-      candidates: candidates.map(candidate => ({
-        ...candidate,
-        href: normalizeUrl(candidate.href, page.url()),
-      })),
+      candidates: normalizedCandidates,
       checkedAt: new Date().toISOString(),
     };
   } catch (e) {
+    const snapshot = await collectPageSnapshot(page, mapping, 'inspect-error', invoiceConfig, { saveArtifacts: true }).catch(() => null);
+    const pageClassification = snapshot
+      ? classifyInvoicePage(snapshot, { invoiceConfig })
+      : classifyInvoicePage({ text: e.message || '' }, { invoiceConfig });
     return {
       status: 'error',
       ...mapping,
       error: e.message,
+      pageClassification,
+      state: ORDER_STATES.FAILED_RETRYABLE,
+      stateTrace: buildInspectionTrace(ORDER_STATES.FAILED_RETRYABLE, pageClassification, 'inspect_error'),
+      artifacts: snapshot?.artifacts || {},
       checkedAt: new Date().toISOString(),
     };
   }
@@ -3126,9 +4645,13 @@ async function inspectOrder(page, mapping) {
 
 function shouldSkipExisting(result) {
   if (!result) return false;
+  if (cliArgs.action === 'chat') {
+    return ['downloaded', 'file_exists'].includes(result.execution?.status)
+      || result.execution?.chatReplyResult?.replyCategory === 'price_diff_required';
+  }
   if (artifactLooksLikeWrongTitle(result)) return false;
   if (cliArgs.execute) {
-    return TERMINAL_EXECUTION_STATUS.has(result.execution?.status);
+    return TERMINAL_EXECUTION_STATUS.has(result.execution?.status) || isTerminalState(result.state || result.execution?.state);
   }
   if (RETRYABLE_STATUS.has(result.status)) return false;
   if (cliArgs.retryUncertain && UNCERTAIN_STATUS.has(result.actionPlan?.action)) return false;
@@ -3155,12 +4678,21 @@ function buildSummary(results) {
     mutatingCandidates: 0,
     submitted: 0,
     downloaded: 0,
+    fileExists: 0,
     pending: 0,
     blocked: 0,
     skipped: 0,
     expiredDeadline: 0,
     sellerContacted: 0,
     manualRequired: 0,
+    needPriceDiffConfirm: 0,
+    needManualSecurityCheck: 0,
+    needManualPaymentConfirm: 0,
+    failedRetryable: 0,
+    failedFinal: 0,
+    chatDownloaded: 0,
+    chatWaitingReply: 0,
+    chatManualRequired: 0,
   };
 
   for (const result of results) {
@@ -3181,12 +4713,25 @@ function buildSummary(results) {
     }
     if (result.execution?.status === 'submitted') summary.submitted++;
     if (result.execution?.status === 'downloaded') summary.downloaded++;
+    if (result.execution?.status === 'file_exists') {
+      summary.fileExists++;
+      summary.downloaded++;
+    }
     if (result.execution?.status === 'pending') summary.pending++;
     if (result.execution?.status === 'blocked') summary.blocked++;
     if (result.execution?.status === 'skipped') summary.skipped++;
     if (result.execution?.status === 'expired_deadline') summary.expiredDeadline++;
     if (result.execution?.status === 'seller_contacted') summary.sellerContacted++;
     if (result.execution?.status === 'manual_required') summary.manualRequired++;
+    if (result.execution?.status === 'chat_waiting_reply') summary.chatWaitingReply++;
+    if (result.execution?.action === 'chat_followup' && ['downloaded', 'file_exists'].includes(result.execution?.status)) summary.chatDownloaded++;
+    if (result.execution?.action === 'chat_followup' && result.execution?.status === 'manual_required') summary.chatManualRequired++;
+    const state = result.state || result.execution?.state;
+    if (state === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) summary.needPriceDiffConfirm++;
+    if (state === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) summary.needManualSecurityCheck++;
+    if (state === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM) summary.needManualPaymentConfirm++;
+    if (state === ORDER_STATES.FAILED_RETRYABLE) summary.failedRetryable++;
+    if (state === ORDER_STATES.FAILED_FINAL) summary.failedFinal++;
   }
   return summary;
 }
@@ -3200,7 +4745,7 @@ async function main() {
     throw new Error(`执行模式需要 --confirm=${CONFIRM_TEXT}`);
   }
   if (cliArgs.execute && !EXECUTABLE_ACTIONS.has(cliArgs.action)) {
-    throw new Error(`执行模式目前只支持 --action=apply、--action=reissue、--action=download 或 --action=all`);
+    throw new Error(`执行模式目前只支持 --action=apply、--action=reissue、--action=download、--action=chat 或 --action=all`);
   }
   const invoiceConfig = cliArgs.execute ? loadInvoiceConfig() : null;
 
@@ -3215,6 +4760,7 @@ async function main() {
   }
   if (cliArgs.execute) {
     seedContactedLedgerFromArtifacts();
+    seedModifiedLedgerFromArtifacts();
   }
   const overdueCutoffByMonth = new Map();
   for (const existing of Object.values(resultsById)) {
@@ -3240,6 +4786,27 @@ async function main() {
   try {
     await ensureLoggedIn(page);
 
+    if (cliArgs.action === 'chat' && cliArgs.orderIds.length === 0) {
+      const contactedLedger = loadContactedLedger();
+      const mappingById = new Map();
+      for (const record of Object.values(contactedLedger.orders || {})) {
+        if (!record?.orderId) continue;
+        mergeMappingCandidate(mappingById, {
+          bizOrderId: String(record.orderId),
+          platform: 'taobao',
+          orderDate: record.orderDate || '',
+          amount: record.amount || '',
+          shopName: record.shopName || '',
+          url: record.invoiceUrl || buildInvoiceDetailUrl(record.orderId),
+          detailUrl: record.invoiceUrl || '',
+          invoiceUrl: record.invoiceUrl || buildInvoiceDetailUrl(record.orderId),
+          sourceTag: 'contacted_ledger_chat_followup',
+        });
+      }
+      mappings = [...mappingById.values()];
+      console.log(`\n💬 聊天回访模式：从联系商家台账读取 ${mappings.length} 个订单`);
+    }
+
     if (!mappings && cliArgs.orderIds.length > 0) {
       const prioritized = cliArgs.orderIds
         .map(orderId => artifactMappings.get(orderId))
@@ -3250,7 +4817,16 @@ async function main() {
       }
       const missingFromArtifacts = cliArgs.orderIds.filter(orderId => !mappingById.has(orderId));
       for (const orderId of missingFromArtifacts) {
-        mergeMappingCandidate(mappingById, buildFallbackMappingFromOrderId(orderId));
+        const contactedRecord = getContactedLedgerRecord(orderId);
+        mergeMappingCandidate(mappingById, contactedRecord ? {
+          ...buildFallbackMappingFromOrderId(orderId),
+          orderDate: contactedRecord.orderDate || '',
+          amount: contactedRecord.amount || '',
+          shopName: contactedRecord.shopName || '',
+          invoiceUrl: contactedRecord.invoiceUrl || buildInvoiceDetailUrl(orderId),
+          url: contactedRecord.invoiceUrl || buildInvoiceDetailUrl(orderId),
+          sourceTag: 'contacted_ledger_chat_followup',
+        } : buildFallbackMappingFromOrderId(orderId));
       }
       mappings = cliArgs.orderIds.map(orderId => mappingById.get(orderId)).filter(Boolean);
       if (missingFromArtifacts.length > 0) {
@@ -3310,7 +4886,7 @@ async function main() {
       const overdueCutoff = monthKey ? overdueCutoffByMonth.get(monthKey) : '';
       if (cliArgs.execute && overdueCutoff && mapping.orderDate && mapping.orderDate <= overdueCutoff) {
         const skippedResult = buildExpiredDeadlineSkipResult(mapping, overdueCutoff);
-        resultsById[mapping.bizOrderId] = skippedResult;
+        resultsById[mapping.bizOrderId] = finalizeOrderResult(skippedResult);
         console.log(`  [${i + 1}/${mappings.length}] ${mapping.bizOrderId} (${mapping.platform}) → apply_invoice / expired_deadline | ${skippedResult.execution.reason}`);
         saveJsonAtomic(PROGRESS_FILE, {
           version: '0.1.0',
@@ -3327,9 +4903,30 @@ async function main() {
       try {
         result = cliArgs.execute
           ? await executeInvoiceAction(context, page, mapping, invoiceConfig)
-          : await inspectOrder(page, mapping);
+          : await inspectOrder(page, mapping, invoiceConfig || {});
       } finally {
         await closeAuxiliaryPages(context, page);
+      }
+      result = finalizeOrderResult(result);
+      if (shouldCaptureResultSnapshot(result)) {
+        const snapshot = await collectPageSnapshot(
+          page,
+          mapping,
+          `final-${result.state || result.execution?.status || result.status}`,
+          invoiceConfig || {},
+          {
+            saveArtifacts: true,
+            historyText: result.history?.historyText || '',
+            invoiceInfo: result.invoiceInfo || null,
+            candidates: result.candidates || null,
+          }
+        ).catch(() => null);
+        if (snapshot?.artifacts) {
+          result.artifacts = {
+            ...(result.artifacts || {}),
+            ...snapshot.artifacts,
+          };
+        }
       }
       resultsById[mapping.bizOrderId] = result;
 
@@ -3383,12 +4980,23 @@ async function main() {
     if (cliArgs.execute) {
       console.log(`  已提交：${summary.submitted}`);
       console.log(`  已下载：${summary.downloaded}`);
+      console.log(`  复用已下载文件：${summary.fileExists}`);
       console.log(`  处理中：${summary.pending}`);
       console.log(`  已阻止：${summary.blocked}`);
       console.log(`  已跳过：${summary.skipped}`);
       console.log(`  超期开票：${summary.expiredDeadline}`);
       console.log(`  已联系商家：${summary.sellerContacted}`);
       console.log(`  需人工处理：${summary.manualRequired}`);
+      console.log(`  待确认补差：${summary.needPriceDiffConfirm}`);
+      console.log(`  待人工安全验证：${summary.needManualSecurityCheck}`);
+      console.log(`  待人工付款确认：${summary.needManualPaymentConfirm}`);
+      console.log(`  可重试失败：${summary.failedRetryable}`);
+      console.log(`  最终失败：${summary.failedFinal}`);
+      if (cliArgs.action === 'chat') {
+        console.log(`  聊天回访下载：${summary.chatDownloaded}`);
+        console.log(`  聊天等待回复：${summary.chatWaitingReply}`);
+        console.log(`  聊天需人工确认：${summary.chatManualRequired}`);
+      }
     }
     console.log(`\n💾 结果文件: ${OUTPUT_FILE}`);
     console.log(`💾 结果表: ${OUTPUT_CSV_FILE}`);
@@ -3406,7 +5014,14 @@ async function main() {
   }
 }
 
-main().catch(e => {
-  console.error('❌ 致命错误:', e.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(e => {
+    console.error('❌ 致命错误:', e.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  classifyChatReply,
+  isLikelyInvoiceHref,
+};

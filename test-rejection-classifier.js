@@ -33,6 +33,16 @@ const cases = [
     expected: 'modify_invoice',
   },
   {
+    name: 'wrong title without modify contacts seller',
+    historyText: [
+      '卖家拒绝了发票申请',
+      '拒绝类型：买家抬头信息输入有误',
+      '拒绝原因：请核实发票信息后再开具',
+    ].join('\n'),
+    hasModifyEntry: false,
+    expected: 'contact_seller',
+  },
+  {
     name: 'already issued invoice needs manual confirmation',
     historyText: [
       '卖家拒绝了发票申请',
