@@ -16,7 +16,7 @@
 
 ## 版本选择
 
-- 最新版本：[`v1.2.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.2.0)，包含脚本脱敏处理、错误分类增强、商家联系台账、聊天回访和新版测试脚本。
+- 最新版本：[`v1.2.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.2.0)，包含错误分类增强、状态机、盘点报告、商家联系台账、聊天回访和新版测试脚本。
 - 稳定功能版：[`v1.1.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.1.0)，包含状态检查、修复和补处理脚本。
 - 基础公开版：[`v1.0.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.0.0)，保留最早公开发布的基础自动化能力。
 
@@ -56,7 +56,7 @@ npm install
 cp invoice-config.example.json invoice-config.json
 ```
 
-`invoice-config.json` 已加入 `.gitignore`，不要提交真实税号、地址、银行账户等敏感信息。
+`invoice-config.json` 已加入 `.gitignore`，不要提交真实税号、地址、银行账户等个人配置。
 
 ## 常用命令
 
