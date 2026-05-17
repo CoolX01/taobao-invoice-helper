@@ -13,15 +13,7 @@ const cases = [
     category: 'invoice_link_found',
     status: 'can_download',
   },
-  {
-    name: 'seller asks price diff',
-    snapshot: {
-      bodyText: '这个订单需要补差 8.8 元后才能开票',
-      frames: [{ links: [] }],
-    },
-    category: 'price_diff_required',
-    status: 'manual_required',
-  },
+
   {
     name: 'wangwang file card',
     snapshot: {

@@ -18,6 +18,9 @@ const {
   deriveStateFromExecution,
   isTerminalState,
 } = require('./order-state-machine');
+const { log, setLogLevel } = require('./src/logger');
+const { RateLimiter } = require('./src/rate-limiter');
+const { gotoWithRetry, waitForContentReady, withPageTimeout } = require('./src/page-navigator');
 
 function formatDate(date) {
   const year = date.getFullYear();
@@ -175,6 +178,20 @@ const CONFIG = {
   maxRetries: cliArgs.maxRetries,
 };
 
+const ORDER_TIMEOUT_MS = 120000; // 单订单最大处理时间 2 分钟
+
+async function withOrderTimeout(fn, timeoutMs = ORDER_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('ORDER_TIMEOUT: 单订单处理超时')), timeoutMs);
+  });
+  try {
+    return await Promise.race([fn(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const LOGIN_URL_MARKERS = [
   'login',
   'havanaone',
@@ -198,6 +215,18 @@ const ACTION_KEYWORDS = [
 const MUTATING_ACTIONS = new Set(['apply_invoice', 'reissue_invoice', 'modify_invoice', 'send_email']);
 const RETRYABLE_STATUS = new Set(['error']);
 const UNCERTAIN_STATUS = new Set(['unknown', 'no_action']);
+
+// Adaptive rate limiter
+const rateLimiter = new RateLimiter({
+  delayMin: CONFIG.delayMin,
+  delayMax: CONFIG.delayMax,
+  batchSize: 10,
+  batchPauseMin: 5000,
+  batchPauseMax: 15000,
+  cooldownDurationMs: 300000,
+  cooldownDelayMin: 8000,
+  cooldownDelayMax: 20000,
+});
 const EXECUTABLE_ACTIONS = new Set(['reissue', 'apply', 'download', 'all', 'chat']);
 const TERMINAL_EXECUTION_STATUS = new Set(['submitted', 'pending', 'downloaded', 'file_exists', 'skipped', 'seller_contacted']);
 
@@ -233,7 +262,6 @@ const WEB_CHAT_TEXTS = ['网页聊天', '网页版聊天', '继续网页聊天',
 const CHAT_HINT_CLOSE_SELECTORS = ['.next-balloon-close', '[aria-label="关闭"]', '[title="关闭"]'];
 const CHAT_INVOICE_FILE_EXTENSIONS = ['.pdf', '.ofd', '.xml', '.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.webp'];
 const CHAT_INVOICE_LINK_PATTERN = /发票|电子票|电子发票|开票|附件|文件|下载|pdf|ofd|invoice|fapiao|bill/i;
-const CHAT_PAYMENT_PATTERN = /补差|差价|差额|付款|支付|收款码|补款|补邮费|补运费/;
 const CHAT_INFO_REQUEST_PATTERN = /请.*(提供|补充|发送).*(邮箱|抬头|税号|纳税人|资料|信息)|需要.*(邮箱|抬头|税号|纳税人|资料|信息)|(邮箱|抬头|税号|纳税人识别号).*(发一下|提供一下|发我|给我)/;
 const CHAT_REJECTION_PATTERN = /无法开|不能开|开不了|不给开|不支持开|已超过|过期|超时|无法补开|无法重开/;
 const CHAT_FILE_DOWNLOAD_TEXTS = ['下载文件', '下载附件', '保存文件', '下载'];
@@ -283,8 +311,7 @@ async function withTimeout(promise, timeoutMs, fallbackValue) {
 }
 
 function randomDelay() {
-  const { delayMin, delayMax } = CONFIG;
-  return sleep(delayMin + Math.random() * (delayMax - delayMin));
+  return rateLimiter.wait();
 }
 
 function isLoginOrVerifyUrl(url) {
@@ -670,7 +697,6 @@ function saveResultsCsv(file, results) {
     'page_classification',
     'matched_rules',
     'failure_reason',
-    'price_diff_amount',
     'invoice_file_path',
     'chat_reply_category',
     'chat_invoice_link',
@@ -694,7 +720,6 @@ function saveResultsCsv(file, results) {
       result.pageClassification?.category || '',
       (result.pageClassification?.matchedRules || []).map(rule => rule.id).join('|'),
       result.execution?.reason || result.error || '',
-      result.pageClassification?.priceDiff?.amount || result.execution?.pageClassification?.priceDiff?.amount || '',
       result.execution?.downloadResult?.path || result.execution?.downloadResult?.existingPath || result.execution?.chatReplyResult?.downloadResult?.path || result.execution?.chatReplyResult?.downloadResult?.existingPath || '',
       result.execution?.chatReplyResult?.replyCategory || result.chatReply?.replyCategory || '',
       result.execution?.chatReplyResult?.invoiceLink || result.chatReply?.invoiceLink || '',
@@ -1057,18 +1082,16 @@ function mergeMappingCandidate(targetMap, candidate) {
 }
 
 function getArtifactFiles() {
-  return [
-    'invoice-action-2025-2026-execute.json',
-    'invoice-action-2025-2026-progress.json',
-    'invoice-action-2025-2026-status-2026-05-14.json',
-    'invoice-action-2025-2026-status-2026-05-14.progress.json',
-    'invoice-action-expired-contact.json',
-    'invoice-action-expired-contact-progress.json',
-    'repair-paper-invoices-2026-05-15.json',
-    'repair-paper-invoices-2026-05-15.progress.json',
-    'repair-paper-invoices-2026-05-14.json',
-    'repair-pending-invoices-2026-05-14.json',
-  ];
+  return fs.readdirSync(__dirname)
+    .filter(name => /^(invoice-action|repair-).*\.json$/i.test(name))
+    .filter(name => !name.includes('progress')
+      && !name.includes('config')
+      && name !== path.basename(OUTPUT_FILE)
+      && name !== path.basename(PROGRESS_FILE)
+      && name !== path.basename(CONTACTED_LEDGER_FILE)
+      && name !== path.basename(DOWNLOADED_LEDGER_FILE)
+      && name !== path.basename(MODIFIED_LEDGER_FILE)
+      && name !== path.basename(CHAT_REPLY_LEDGER_FILE));
 }
 
 function collectMappingsFromArtifacts() {
@@ -1354,6 +1377,7 @@ async function waitForRelevantPageContent(page, timeout = CONFIG.actionReadyTime
 
 async function pauseForManualVerification(page, reason) {
   console.log(`⚠️  触发人工验证: ${reason}`);
+  rateLimiter.recordVerification();
   await waitForRelevantPageContent(page, CONFIG.manualTimeoutMs);
   const currentText = await page.evaluate(() => document.body.innerText || '').catch(() => '');
   const parseResult = classifyPageErrorText(currentText);
@@ -1905,17 +1929,7 @@ function classifyChatReply(snapshot) {
   const invoiceLinks = links.filter(link => isLikelyInvoiceHref(link.href, `${link.text} ${link.title} ${link.ariaLabel} ${link.downloadName}`));
   const hasFileCard = isLikelyChatInvoiceFileText(rawText) && /下载文件|下载附件|PDF|OFD|\[文件\]/i.test(rawText);
 
-  if (CHAT_PAYMENT_PATTERN.test(compact)) {
-    const priceDiff = compact.match(/(?:补差|差价|差额|付款|支付|补款)[^0-9]{0,12}([0-9]+(?:\.[0-9]{1,2})?)/);
-    return {
-      replyCategory: 'price_diff_required',
-      status: 'manual_required',
-      state: ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM,
-      reason: priceDiff ? `商家聊天回复要求补差/付款，金额疑似 ${priceDiff[1]}` : '商家聊天回复要求补差/付款',
-      invoiceLinks,
-      priceDiffAmount: priceDiff?.[1] || '',
-    };
-  }
+
 
   if (invoiceLinks.length > 0 || hasFileCard) {
     return {
@@ -2393,7 +2407,24 @@ async function validateFilledInvoiceForm(page, invoiceConfig) {
     });
   }
 
-  return {
+    // Cross-check: tax number should not equal company name
+  if (taxActual && companyActual && taxActual === companyActual) {
+    mismatches.push({
+      fieldName: 'taxNo_equals_companyName',
+      expected: '税号和公司名应不同',
+      actual: taxActual,
+    });
+  }
+  // Tax number format validation
+  if (taxActual && !/^[0-9A-Za-z]{15,20}$/.test(taxActual.replace(/\s/g, ''))) {
+    mismatches.push({
+      fieldName: 'taxNo_format_invalid',
+      expected: '15-20位数字字母',
+      actual: taxActual,
+    });
+  }
+
+return {
     ok: mismatches.length === 0,
     mismatches,
     companyValue: { ...companyValue, value: companyActual, found: companyValue.found || Boolean(companyActual) },
@@ -3829,7 +3860,13 @@ async function clickSubmitInvoiceForm(page) {
       if (!(await target.isVisible().catch(() => false))) continue;
       if (await target.isDisabled().catch(() => false)) continue;
       await target.click({ timeout: 8000 });
-      await sleep(2000);
+      // Wait for page to show success/failure signal instead of fixed delay
+      await page.waitForFunction(() => {
+        const t = document.body?.innerText || '';
+        return ['申请成功', '提交成功', '换开成功', '处理中', '已提交',
+                '失败', '错误', '验证码', '请重试', '商家正在处理'].some(w => t.includes(w));
+      }, { timeout: 10000 }).catch(() => null);
+      await sleep(500);
       return { submitted: true, text };
     }
   }
@@ -3907,8 +3944,6 @@ function shouldCaptureResultSnapshot(result) {
     || state === ORDER_STATES.FAILED_RETRYABLE
     || state === ORDER_STATES.FAILED_FINAL
     || state === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK
-    || state === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM
-    || state === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM
     || category === 'unknown_error'
     || category === 'download_failed'
   );
@@ -3970,19 +4005,7 @@ async function retryableFormSubmit(context, page, mapping, invoiceConfig, inspec
       candidates: await collectActionCandidates(page).catch(() => []),
     }, { invoiceConfig });
     const parsedError = classifyPageErrorText(afterText);
-    if (afterClassification.status === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM || afterClassification.status === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) {
-      return buildExecutionMeta(inspection, {
-        action: mode,
-        status: 'manual_required',
-        state: afterClassification.status,
-        retries,
-        fillResult,
-        submitResult,
-        pageClassification: afterClassification,
-        priceDiff: afterClassification.priceDiff,
-        reason: afterClassification.manualReason || afterClassification.rawPrompt || '页面提示补差或金额差异',
-      });
-    }
+
     if (parsedError.hasRetryableError && retries < CONFIG.maxRetries) {
       retries += 1;
       lastReason = parsedError.primaryReason || '提交后页面提示可修正错误';
@@ -4052,19 +4075,7 @@ async function executeApplyInvoice(context, page, mapping, invoiceConfig) {
       }),
     };
   }
-  if ([ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM, ORDER_STATES.NEED_PRICE_DIFF_CONFIRM].includes(inspection.pageClassification?.status)) {
-    return {
-      ...inspection,
-      execution: buildExecutionMeta(inspection, {
-        action: 'apply_invoice',
-        status: 'manual_required',
-        state: inspection.pageClassification.status,
-        pageClassification: inspection.pageClassification,
-        priceDiff: inspection.pageClassification.priceDiff,
-        reason: inspection.pageClassification.manualReason || inspection.pageClassification.rawPrompt || '页面提示补差或金额差异',
-      }),
-    };
-  }
+
 
   const hasApplyCandidate = inspection.candidates?.some(candidate => candidate.type === 'apply_invoice' && candidate.visible && !candidate.disabled);
   if (inspection.invoiceInfo?.invoiceType !== 'no_invoice') {
@@ -4431,19 +4442,7 @@ async function executeInvoiceAction(context, page, mapping, invoiceConfig) {
       }),
     };
   }
-  if ([ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM, ORDER_STATES.NEED_PRICE_DIFF_CONFIRM].includes(inspection.pageClassification?.status)) {
-    return {
-      ...inspection,
-      execution: buildExecutionMeta(inspection, {
-        action: 'manual_payment_or_price_diff',
-        status: 'manual_required',
-        state: inspection.pageClassification.status,
-        pageClassification: inspection.pageClassification,
-        priceDiff: inspection.pageClassification.priceDiff,
-        reason: inspection.pageClassification.manualReason || inspection.pageClassification.rawPrompt || '页面提示补差或金额差异',
-      }),
-    };
-  }
+
   const history = await inspectHistory(context, page);
   const rejectedDecision = classifyRejectedInvoiceHandling(inspection, history);
   if (rejectedDecision.action === 'manual_required') {
@@ -4530,9 +4529,7 @@ function chooseRecommendedAction(invoiceInfo, candidates, pageClassification = n
   if (pageClassification?.status === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) {
     return { action: 'manual_review', confidence: 'high', reason: pageClassification.manualReason || '页面需要人工安全验证' };
   }
-  if (pageClassification?.status === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM || pageClassification?.status === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) {
-    return { action: 'manual_review', confidence: 'high', reason: pageClassification.manualReason || pageClassification.rawPrompt || '页面提示补差或金额差异' };
-  }
+
   if (pageClassification?.recommendedAction === 'contact_seller') {
     return { action: 'contact_seller', confidence: 'high', reason: pageClassification.rawPrompt || '页面提示需要联系商家处理' };
   }
@@ -4577,9 +4574,11 @@ function chooseRecommendedAction(invoiceInfo, candidates, pageClassification = n
 
 async function inspectOrder(page, mapping, invoiceConfig = {}) {
   try {
-    await page.goto(mapping.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeout });
-    await page.waitForLoadState('networkidle', { timeout: CONFIG.detailWaitTimeout }).catch(() => null);
-    await waitForRelevantPageContent(page);
+    await gotoWithRetry(page, mapping.url, { timeout: CONFIG.pageTimeout, maxRetries: 3 });
+    await waitForContentReady(page, {
+      keywords: ACTION_KEYWORDS.flatMap(g => g.words).concat(VERIFICATION_TEXT_MARKERS),
+      timeout: CONFIG.detailWaitTimeout,
+    });
     await sleep(800);
     try { await page.click('text=知道了', { timeout: 1500 }); } catch {}
 
@@ -4646,8 +4645,7 @@ async function inspectOrder(page, mapping, invoiceConfig = {}) {
 function shouldSkipExisting(result) {
   if (!result) return false;
   if (cliArgs.action === 'chat') {
-    return ['downloaded', 'file_exists'].includes(result.execution?.status)
-      || result.execution?.chatReplyResult?.replyCategory === 'price_diff_required';
+    return ['downloaded', 'file_exists'].includes(result.execution?.status);
   }
   if (artifactLooksLikeWrongTitle(result)) return false;
   if (cliArgs.execute) {
@@ -4685,9 +4683,7 @@ function buildSummary(results) {
     expiredDeadline: 0,
     sellerContacted: 0,
     manualRequired: 0,
-    needPriceDiffConfirm: 0,
     needManualSecurityCheck: 0,
-    needManualPaymentConfirm: 0,
     failedRetryable: 0,
     failedFinal: 0,
     chatDownloaded: 0,
@@ -4727,13 +4723,25 @@ function buildSummary(results) {
     if (result.execution?.action === 'chat_followup' && ['downloaded', 'file_exists'].includes(result.execution?.status)) summary.chatDownloaded++;
     if (result.execution?.action === 'chat_followup' && result.execution?.status === 'manual_required') summary.chatManualRequired++;
     const state = result.state || result.execution?.state;
-    if (state === ORDER_STATES.NEED_PRICE_DIFF_CONFIRM) summary.needPriceDiffConfirm++;
     if (state === ORDER_STATES.NEED_MANUAL_SECURITY_CHECK) summary.needManualSecurityCheck++;
-    if (state === ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM) summary.needManualPaymentConfirm++;
     if (state === ORDER_STATES.FAILED_RETRYABLE) summary.failedRetryable++;
     if (state === ORDER_STATES.FAILED_FINAL) summary.failedFinal++;
   }
   return summary;
+}
+
+function slimResultForProgress(result) {
+  if (!result || typeof result !== 'object') return result;
+  const slim = { ...result };
+  delete slim.detailBodyText;
+  delete slim.history;
+  if (slim.artifacts) {
+    slim.artifacts = {
+      screenshotPath: slim.artifacts.screenshotPath || '',
+      htmlSnapshotPath: slim.artifacts.htmlSnapshotPath || '',
+    };
+  }
+  return slim;
 }
 
 async function main() {
@@ -4901,9 +4909,24 @@ async function main() {
 
       let result;
       try {
-        result = cliArgs.execute
-          ? await executeInvoiceAction(context, page, mapping, invoiceConfig)
-          : await inspectOrder(page, mapping, invoiceConfig || {});
+        result = await withOrderTimeout(() =>
+          cliArgs.execute
+            ? executeInvoiceAction(context, page, mapping, invoiceConfig)
+            : inspectOrder(page, mapping, invoiceConfig || {})
+        );
+      } catch (orderError) {
+        if (orderError.message && orderError.message.includes('ORDER_TIMEOUT')) {
+          log('warn', mapping.bizOrderId, 'timeout', '单订单处理超时，跳过');
+          result = {
+            status: 'error',
+            ...mapping,
+            error: orderError.message,
+            state: ORDER_STATES.FAILED_RETRYABLE,
+            checkedAt: new Date().toISOString(),
+          };
+        } else {
+          throw orderError;
+        }
       } finally {
         await closeAuxiliaryPages(context, page);
       }
@@ -4947,11 +4970,14 @@ async function main() {
         dryRun: !cliArgs.execute,
         action: cliArgs.action,
         mappings,
-        resultsById,
+        resultsById: Object.fromEntries(
+          Object.entries(resultsById).map(([k, v]) => [k, slimResultForProgress(v)])
+        ),
         updatedAt: new Date().toISOString(),
       });
 
       await randomDelay();
+      rateLimiter.recordSuccess();
     }
 
     const results = mappings.map(mapping => resultsById[mapping.bizOrderId]).filter(Boolean);
@@ -4987,9 +5013,7 @@ async function main() {
       console.log(`  超期开票：${summary.expiredDeadline}`);
       console.log(`  已联系商家：${summary.sellerContacted}`);
       console.log(`  需人工处理：${summary.manualRequired}`);
-      console.log(`  待确认补差：${summary.needPriceDiffConfirm}`);
       console.log(`  待人工安全验证：${summary.needManualSecurityCheck}`);
-      console.log(`  待人工付款确认：${summary.needManualPaymentConfirm}`);
       console.log(`  可重试失败：${summary.failedRetryable}`);
       console.log(`  最终失败：${summary.failedFinal}`);
       if (cliArgs.action === 'chat') {

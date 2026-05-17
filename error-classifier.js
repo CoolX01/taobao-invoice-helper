@@ -34,27 +34,6 @@ const ERROR_RULES = [
     patterns: SECURITY_MARKERS,
   },
   {
-    id: 'PRICE_DIFF_PAYMENT_REQUIRED',
-    category: 'price_diff_payment_required',
-    status: 'NEED_MANUAL_PAYMENT_CONFIRM',
-    recommendedAction: 'manual_payment_confirm',
-    severity: 940,
-    retryable: false,
-    requiresPaymentConfirm: true,
-    manualReason: '页面提示补差且涉及真实付款，需要用户确认',
-    patterns: ['补差付款', '支付差价', '去付款', '立即付款', '确认付款', '收款码', '补款'],
-  },
-  {
-    id: 'PRICE_DIFF_CONFIRM',
-    category: 'price_diff',
-    status: 'NEED_PRICE_DIFF_CONFIRM',
-    recommendedAction: 'manual_price_diff_confirm',
-    severity: 930,
-    retryable: false,
-    manualReason: '页面提示补差或金额差异，需要确认差额和原因',
-    patterns: ['补差', '差价', '差额', '金额差异', '补邮费', '补运费'],
-  },
-  {
     id: 'DEADLINE_EXCEEDED',
     category: 'deadline_exceeded',
     status: 'NEED_CONTACT_SELLER',
@@ -295,25 +274,6 @@ function findPromptExcerpt(text, patterns) {
   return '';
 }
 
-function extractPriceDiff(text) {
-  const source = String(text || '');
-  const lines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const relevant = lines.find(line => /补差|差价|差额|金额差异|补款|补邮费|补运费/.test(line)) || '';
-  const windows = [relevant, source.slice(0, 4000)];
-  for (const windowText of windows) {
-    const match = windowText.match(/(?:补差|差价|差额|补款|补邮费|补运费|金额差异)[^0-9￥¥]{0,30}[￥¥]?\s*([0-9]+(?:\.[0-9]{1,2})?)/)
-      || windowText.match(/[￥¥]\s*([0-9]+(?:\.[0-9]{1,2})?)[^。；，,\n]{0,30}(?:补差|差价|差额|补款|补邮费|补运费)/)
-      || windowText.match(/([0-9]+(?:\.[0-9]{1,2})?)\s*元[^。；，,\n]{0,30}(?:补差|差价|差额|补款|补邮费|补运费)/);
-    if (match) {
-      return {
-        amount: match[1],
-        reason: relevant || normalizeText(windowText).slice(0, 240),
-        rawText: match[0],
-      };
-    }
-  }
-  return null;
-}
 
 function getMatchedRules(snapshot) {
   const text = [
@@ -436,23 +396,6 @@ function classifyInvoicePage(snapshot = {}, context = {}) {
   }
 
   let primary = refineActionForCurrentPage(matchedRules[0], snapshot);
-  const priceDiff = extractPriceDiff([snapshot.text, snapshot.popupText, snapshot.historyText, snapshot.ocrText].filter(Boolean).join('\n'));
-  if (priceDiff && (!primary || primary.severity < 930)) {
-    const requiresPayment = includesAny(compactText([snapshot.text, snapshot.popupText].join('\n')), ['付款', '支付差价', '补差付款', '收款码']);
-    primary = {
-      id: requiresPayment ? 'PRICE_DIFF_PAYMENT_REQUIRED' : 'PRICE_DIFF_CONFIRM',
-      category: requiresPayment ? 'price_diff_payment_required' : 'price_diff',
-      status: requiresPayment ? 'NEED_MANUAL_PAYMENT_CONFIRM' : 'NEED_PRICE_DIFF_CONFIRM',
-      recommendedAction: requiresPayment ? 'manual_payment_confirm' : 'manual_price_diff_confirm',
-      retryable: false,
-      requiresPaymentConfirm: requiresPayment,
-      manualReason: requiresPayment ? '页面提示补差且涉及真实付款，需要用户确认' : '页面提示补差或金额差异，需要确认差额和原因',
-      matchedPatterns: ['补差'],
-      rawPrompt: priceDiff.reason,
-    };
-    matchedRules.unshift(primary);
-  }
-
   if (!primary) {
     const candidateAction = findCandidateAction(snapshot);
     if (candidateAction) {
@@ -519,7 +462,6 @@ function classifyInvoicePage(snapshot = {}, context = {}) {
       rawPrompt: rule.rawPrompt || '',
     })),
     rawPrompt: primary.rawPrompt || '',
-    priceDiff,
   };
 }
 
@@ -541,7 +483,6 @@ function classifyPageErrorText(text) {
     ].includes(hit.type)),
     hasExpiredError: hits.some(hit => hit.type === 'deadline_exceeded'),
     hasVerificationError: hits.some(hit => hit.type === 'security_verification'),
-    hasPriceDiff: hits.some(hit => hit.type === 'price_diff' || hit.type === 'price_diff_payment_required'),
     primaryReason: hits[0]?.matched || '',
     classification,
   };
@@ -552,7 +493,6 @@ module.exports = {
   SECURITY_MARKERS,
   classifyInvoicePage,
   classifyPageErrorText,
-  extractPriceDiff,
   normalizeText,
   normalizeIdentifier,
   looksLikeTaxNo,

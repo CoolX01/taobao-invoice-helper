@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { classifyInvoicePage, extractPriceDiff } = require('./error-classifier');
+const { classifyInvoicePage } = require('./error-classifier');
 
 const invoiceConfig = {
   companyName: 'EXAMPLE_COMPANY_NAME',
@@ -49,12 +49,7 @@ const cases = [
     expectedStatus: 'FAILED_RETRYABLE',
     expectedAction: 'modify_invoice',
   },
-  {
-    name: 'price diff payment',
-    snapshot: { text: '需要补差付款 ￥12.50，请去付款后再开票' },
-    expectedStatus: 'NEED_MANUAL_PAYMENT_CONFIRM',
-    expectedAction: 'manual_payment_confirm',
-  },
+
   {
     name: 'order refunded',
     snapshot: { text: '交易关闭 已退款，无法申请发票' },
@@ -75,6 +70,5 @@ for (const testCase of cases) {
   assert.strictEqual(result.recommendedAction, testCase.expectedAction, `${testCase.name}: action ${JSON.stringify(result)}`);
 }
 
-assert.deepStrictEqual(extractPriceDiff('商家提示需补差 ￥8.80 才能开票').amount, '8.80');
 
 console.log(`error classifier ok: ${cases.length} cases`);

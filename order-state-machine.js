@@ -13,11 +13,9 @@ const ORDER_STATES = Object.freeze({
   NEED_CONTACT_SELLER: 'NEED_CONTACT_SELLER',
   CONTACTING_SELLER: 'CONTACTING_SELLER',
   CONTACTED_SELLER: 'CONTACTED_SELLER',
-  NEED_PRICE_DIFF_CONFIRM: 'NEED_PRICE_DIFF_CONFIRM',
   FAILED_RETRYABLE: 'FAILED_RETRYABLE',
   FAILED_FINAL: 'FAILED_FINAL',
   NEED_MANUAL_SECURITY_CHECK: 'NEED_MANUAL_SECURITY_CHECK',
-  NEED_MANUAL_PAYMENT_CONFIRM: 'NEED_MANUAL_PAYMENT_CONFIRM',
 });
 
 const VALID_STATES = new Set(Object.values(ORDER_STATES));
@@ -78,7 +76,6 @@ function deriveStateFromExecution(execution = {}, fallback = ORDER_STATES.CHECKI
   if (status === 'expired_deadline') return ORDER_STATES.NEED_CONTACT_SELLER;
   if (status === 'manual_required') {
     if (/验证|验证码|滑块|登录|风控|安全/.test(reason)) return ORDER_STATES.NEED_MANUAL_SECURITY_CHECK;
-    if (/付款|支付|补差|差价|差额/.test(reason)) return ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM;
     return ORDER_STATES.FAILED_FINAL;
   }
   if (status === 'blocked' || status === 'error') return ORDER_STATES.FAILED_RETRYABLE;
@@ -94,8 +91,6 @@ function isTerminalState(state) {
     ORDER_STATES.REISSUED,
     ORDER_STATES.FAILED_FINAL,
     ORDER_STATES.NEED_MANUAL_SECURITY_CHECK,
-    ORDER_STATES.NEED_MANUAL_PAYMENT_CONFIRM,
-    ORDER_STATES.NEED_PRICE_DIFF_CONFIRM,
   ]).has(state);
 }
 
