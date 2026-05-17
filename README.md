@@ -14,6 +14,14 @@
 - 对验证码 / 扫码 / 人机验证暂停，等待人工完成后继续
 - 通过进度文件断点续跑，避免每次从头来
 
+## 版本选择
+
+- 最新版本：[`v1.2.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.2.0)，包含脚本脱敏处理、错误分类增强、商家联系台账、聊天回访和新版测试脚本。
+- 稳定功能版：[`v1.1.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.1.0)，包含状态检查、修复和补处理脚本。
+- 基础公开版：[`v1.0.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.0.0)，保留最早公开发布的基础自动化能力。
+
+详细更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 当前入口
 
 主脚本：

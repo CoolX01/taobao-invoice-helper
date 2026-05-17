@@ -1,7 +1,7 @@
 {
   "name": "taobao-invoice-helper",
-  "version": "1.0.0",
-  "description": "淘宝订单发票规划、申请、下载与换开辅助脚本",
+  "version": "1.2.0",
+  "description": "基于 Playwright 的淘宝/天猫订单发票规划、申请、换开与下载辅助脚本",
   "main": "invoice-actions.js",
   "scripts": {
     "start": "node invoice-actions.js",
@@ -23,7 +23,7 @@
     "automation"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "playwright": "^1.59.1"
   }
