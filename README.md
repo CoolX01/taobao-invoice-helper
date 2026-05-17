@@ -12,10 +12,12 @@
 - 对已联系商家的订单进行聊天回访，识别商家单独回复的发票附件或下载链接。
 - 使用进度文件和台账避免重复处理，支持中断后继续运行。
 - 遇到验证码、扫码、人机验证、付款确认等高风险动作时暂停，等待人工处理。
+- 使用自适应限速、页面导航重试和单订单超时保护，降低长批次运行时卡住或被风控打断的概率。
 
 ## 版本选择
 
-- 最新版本：[`v1.2.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.2.0)，包含错误分类增强、状态机、盘点报告、商家联系台账、聊天回访和新版测试脚本。
+- 最新版本：[`v1.3.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.3.0)，包含模块化辅助组件、页面导航重试、自适应限速、单订单超时保护和更轻量的进度文件。
+- 上一稳定版：[`v1.2.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.2.0)，包含错误分类增强、状态机、盘点报告、商家联系台账、聊天回访和新版测试脚本。
 - 稳定功能版：[`v1.1.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.1.0)，包含状态检查、修复和补处理脚本。
 - 基础公开版：[`v1.0.0`](https://github.com/CoolX01/taobao-invoice-helper/releases/tag/v1.0.0)，保留最早公开发布的基础自动化能力。
 
@@ -117,6 +119,8 @@ npm run debug:invoice-form -- --plan-file=invoice-action-progress.json --order-i
 - `FAILED_RETRYABLE` / `FAILED_FINAL`：可重试失败 / 最终失败。
 
 页面识别由 `error-classifier.js` 统一处理，当前覆盖可申请、可下载、信息不符、超期开票、商家拒绝、资料缺失、补差金额、聊天发票回复、订单异常、安全验证、下载异常等常见情况。
+
+`v1.3.0` 起，部分通用能力已经拆到 `src/logger.js`、`src/rate-limiter.js` 和 `src/page-navigator.js`，后续补导航、日志或节流策略时会更容易维护。
 
 ## 已知限制
 
